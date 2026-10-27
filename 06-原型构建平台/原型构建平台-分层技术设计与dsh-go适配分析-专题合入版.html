@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>原型构建平台 · 分层技术设计与 dsh-go 适配分析</title>
+<style>
+:root{--ink:#1d2129;--sub:#4e5969;--line:#e5e6eb;--bg:#f7f8fa;--brand:#5b3fd9;--ok:#00a870;--warn:#d9822b;--bad:#d54941}
+*{box-sizing:border-box}
+body{margin:0;background:#fff;color:var(--ink);font:15px/1.75 -apple-system,"PingFang SC","Helvetica Neue",Arial,sans-serif}
+.wrap{max-width:1040px;margin:0 auto;padding:48px 32px 96px}
+h1{font-size:30px;margin:0 0 8px}
+h2{font-size:22px;margin:56px 0 14px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+h3{font-size:17px;margin:30px 0 8px}
+h4{font-size:15px;margin:20px 0 6px;color:var(--brand)}
+p{margin:8px 0}
+.meta{color:var(--sub);font-size:13px}
+.box{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:14px 18px;margin:14px 0}
+.box.key{border-left:4px solid var(--brand)}
+.box.warn{border-left:4px solid var(--warn)}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+th{background:var(--bg);font-weight:600;white-space:nowrap}
+code,pre{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:12.5px}
+code{background:#f2f3f5;padding:1px 5px;border-radius:3px}
+pre{background:#f7f8fa;color:#1d2129;border:1px solid #e5e6eb;padding:14px 16px;border-radius:8px;overflow:auto;line-height:1.55}
+.tag{display:inline-block;font-size:11.5px;font-weight:600;padding:0 6px;border-radius:3px;margin-right:4px;line-height:19px}
+.p0{background:#e8f7f0;color:var(--ok)}.p1{background:#fdf1e3;color:var(--warn)}.rs{background:#ece8fb;color:var(--brand)}.as{background:#fbe9e8;color:var(--bad)}
+td.st{text-align:center;font-weight:700;white-space:nowrap}
+td.st.ok{color:var(--ok)}td.st.warn{color:var(--warn)}td.st.no{color:var(--bad)}
+ul,ol{padding-left:22px;margin:6px 0}
+li{margin:3px 0}
+svg text{font-family:-apple-system,"PingFang SC",Arial,sans-serif}
+.toc a{color:var(--brand);text-decoration:none}
+</style>
+</head>
+<body><div class="wrap">
+
+<h1>原型构建平台 · 分层技术设计与 dsh-go 适配分析</h1>
+<p class="meta">依据：<code>/Users/zhangyong/mdev/agent/magents/dsh-go</code> 源码与文档（2026-10-19 实测：<code>go build</code> 通过，<code>go test ./dsh-go/...</code> 全部通过）。承接上一版《最小核心架构设计 P0》，本文细化每一层的功能、模块、API、流程，并给出 dsh-go 作为 Agent Runtime 的接口充分性结论。</p>
+
+<div class="box key">
+<p><b>结论（已合入沙箱隔离与多用户并发专题）</b></p>
+<p>dsh-go 的 HTTP + SSE、ReAct、工具和会话日志可继续复用；当前实现提供会话分离与进程组控制，<b>尚不提供完整多租户安全沙箱</b>。29 项能力重新评估为 8 项满足、11 项部分满足、10 项未提供；冷加载、取消、事件顺序和恢复属于多人使用前的必修项，不能用现有普通测试全绿替代专项验收。</p>
+<p>四层架构保持不变：<b>每对话独立容器与卷，不同对话并行，同对话修改串行</b>；控制层仍为 Go 单体，承接身份、归属、幂等、配额和展示，wsd 承接工作区与预览。P0 必须补齐可信身份、Runtime 执行幂等、确认停止后释放锁、事件提交后广播，以及 Run／在线沙箱／构建三类配额。P0 单实例；多副本前再启用租约、fencing 和跨实例订阅通知。</p>
+<p>保留 S1–S6，并新增 S7–S10（§3.3）覆盖执行一致性与资源上限；不再承诺约 500 行即可完成安全加固。共容器试点仍有 Agent 与生成应用互相干扰的残余风险；需隔离不可信产品进程时拆分预览容器或执行身份。<b>性能按真实模型、构建峰值、常驻预览、长会话依次验证</b>，不使用未经 Linux 容器压测的并发容量数字。</p>
+</div>
+<p class="meta">专题合入版 · 2026-10-19 · 保留四层架构、11 个主章节与 2 张原图，修订执行时序；新增 7 个重点小节，具体优化均为待实施设计。</p>
+<div class="box warn"><b>版本边界：</b>本次只更新设计文档，不修改 dsh-go 代码或部署平台。依据为 2026-10-19 源码审查与本机局部探针；容器方案、S1–S10 和新增 API 均为待实现设计。详细证据见 <a href="运行时沙箱隔离与多用户并发专题分析.md">《运行时沙箱隔离与多用户并发专题分析》</a>；本稿仅提炼决策、契约和验收，不重复搬入全部实验过程。</div>
+
+<div class="box toc"><b>目录</b>
+<ol>
+<li><a href="#s1">总体形态与相对上一版的修订</a></li>
+<li><a href="#s2">dsh-go 作为 Runtime：接口充分性评估</a></li>
+<li><a href="#s3">抽离与改造：控制层承担什么，dsh-go 改什么</a></li>
+<li><a href="#s4">Runtime 层设计（沙箱、wsd、配置、项目约定）</a></li>
+<li><a href="#s5">控制层设计（模块、API、状态机、事件映射）</a></li>
+<li><a href="#s6">接入层设计</a></li>
+<li><a href="#s7">Web 层设计</a></li>
+<li><a href="#s8">关键流程</a></li>
+<li><a href="#s9">数据模型修订</a></li>
+<li><a href="#s10">实施顺序、性能优化与验收</a></li>
+<li><a href="#s11">风险与待确认项</a></li>
+</ol></div>
+
+<h2 id="s1">1. 总体形态与相对上一版的修订</h2>
+<h3>1.1 修订后的总体形态</h3>
+<svg viewBox="0 0 960 540" width="100%" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4e5969"/></marker></defs>
+<rect x="10" y="10" width="150" height="70" rx="8" fill="#f2f3ff" stroke="#c9c2f5"/>
+<text x="85" y="40" text-anchor="middle" font-size="13" font-weight="700" fill="#5b3fd9">① Web</text>
+<text x="85" y="60" text-anchor="middle" font-size="11.5" fill="#4e5969">Vue3 · SSE · Monaco</text>
+<rect x="190" y="10" width="150" height="70" rx="8" fill="#e8f3ff" stroke="#b6d4f5"/>
+<text x="265" y="40" text-anchor="middle" font-size="13" font-weight="700" fill="#1f6fc5">② 接入层</text>
+<text x="265" y="60" text-anchor="middle" font-size="11.5" fill="#4e5969">Caddy · 反代 · TLS</text>
+<path d="M160 45 H190" stroke="#4e5969" marker-end="url(#a)"/>
+<rect x="370" y="10" width="300" height="270" rx="8" fill="#e8f7f0" stroke="#a8dcc4"/>
+<text x="520" y="32" text-anchor="middle" font-size="13" font-weight="700" fill="#00855a">③ 控制层（Go 单体）</text>
+<g font-size="12" text-anchor="middle">
+<rect x="386" y="44" width="130" height="38" rx="5" fill="#fff" stroke="#a8dcc4"/><text x="451" y="68">对话 / 消息</text>
+<rect x="524" y="44" width="130" height="38" rx="5" fill="#fff" stroke="#a8dcc4"/><text x="589" y="68">Run 编排 + 闸门</text>
+<rect x="386" y="90" width="130" height="38" rx="5" fill="#fff" stroke="#a8dcc4"/><text x="451" y="114">事件中心 + 映射</text>
+<rect x="524" y="90" width="130" height="38" rx="5" fill="#fff" stroke="#a8dcc4"/><text x="589" y="114">沙箱管理 + 配额</text>
+<rect x="386" y="136" width="130" height="38" rx="5" fill="#fff" stroke="#a8dcc4"/><text x="451" y="160">文件 / 预览代理</text>
+<rect x="524" y="136" width="130" height="38" rx="5" fill="#fff" stroke="#a8dcc4"/><text x="589" y="160">模型目录 + LLM 代理</text>
+<rect x="386" y="182" width="130" height="38" rx="5" fill="#fff" stroke="#9aa5b5" stroke-dasharray="4 3"/><text x="451" y="206" fill="#4e5969">AuthProvider</text>
+<rect x="524" y="182" width="130" height="38" rx="5" fill="#fff" stroke="#9aa5b5" stroke-dasharray="4 3"/><text x="589" y="206" fill="#4e5969">Git / Deploy（P1）</text>
+</g>
+<text x="520" y="246" text-anchor="middle" font-size="11.5" fill="#4e5969">MySQL：对话 · 消息 · Run · 事件 · 沙箱 · 用量</text>
+<text x="520" y="264" text-anchor="middle" font-size="11.5" fill="#4e5969">对外 :8080（API）　预览 :8081（独立域名）</text>
+<path d="M340 45 H370" stroke="#4e5969" marker-end="url(#a)"/>
+<rect x="700" y="10" width="250" height="400" rx="8" fill="#fdf1e3" stroke="#f0cfa6"/>
+<text x="825" y="32" text-anchor="middle" font-size="13" font-weight="700" fill="#b26a14">④ 沙箱容器（每个对话一个）</text>
+<g font-size="12" text-anchor="middle">
+<rect x="716" y="44" width="218" height="86" rx="6" fill="#fff" stroke="#f0cfa6"/>
+<text x="825" y="64" font-weight="700">wsd（PID 1，:7000）</text>
+<text x="825" y="82" font-size="11" fill="#4e5969">/agent/** 反代 dshd　/fs/** 文件树</text>
+<text x="825" y="98" font-size="11" fill="#4e5969">/preview/** 守护　/git/** 提交</text>
+<text x="825" y="114" font-size="11" fill="#4e5969">/events 文件变更与预览状态</text>
+<rect x="716" y="142" width="218" height="64" rx="6" fill="#fff" stroke="#f0cfa6"/>
+<text x="825" y="164" font-weight="700">dsh-go（127.0.0.1:3080）</text>
+<text x="825" y="182" font-size="11" fill="#4e5969">ReAct · 工具 · 会话日志 · 技能</text>
+<text x="825" y="197" font-size="11" fill="#4e5969">仅 1 个会话，full-auto</text>
+<rect x="716" y="218" width="218" height="50" rx="6" fill="#fff" stroke="#f0cfa6"/>
+<text x="825" y="240" font-weight="700">生成的应用（:3000）</text>
+<text x="825" y="257" font-size="11" fill="#4e5969">由 wsd 守护，start.sh 启动</text>
+<rect x="716" y="280" width="218" height="62" rx="6" fill="#fff" stroke="#f0cfa6"/>
+<text x="825" y="302" font-weight="700">卷 /workspace</text>
+<text x="825" y="319" font-size="11" fill="#4e5969">app/（Git）　.dsh/（会话日志）</text>
+<text x="825" y="334" font-size="11" fill="#4e5969">不含任何长期密钥</text>
+<text x="825" y="368" font-size="11" fill="#4e5969">独立网络 · 1 CPU · 2 GB · 非 root</text>
+<text x="825" y="386" font-size="11" fill="#4e5969">只放行：控制层 LLM 代理、包镜像</text>
+</g>
+<path d="M670 70 H700" stroke="#4e5969" marker-end="url(#a)"/>
+<text x="685" y="62" text-anchor="middle" font-size="10" fill="#4e5969">HTTP</text>
+<path d="M700 100 H670" stroke="#4e5969" stroke-dasharray="4 3" marker-end="url(#a)"/>
+<text x="685" y="118" text-anchor="middle" font-size="10" fill="#4e5969">SSE</text>
+<rect x="370" y="430" width="300" height="60" rx="8" fill="#f2f3f5" stroke="#c9cdd4"/>
+<text x="520" y="456" text-anchor="middle" font-size="13" font-weight="700" fill="#4e5969">模型提供方 / 内部镜像源</text>
+<text x="520" y="476" text-anchor="middle" font-size="11.5" fill="#4e5969">真实 API Key 只存在于控制层</text>
+<path d="M520 280 V430" stroke="#4e5969" marker-end="url(#a)"/>
+<path d="M825 410 C825 440 700 450 672 450" stroke="#4e5969" stroke-dasharray="4 3" fill="none" marker-end="url(#a)"/>
+<text x="760" y="446" font-size="10.5" fill="#4e5969">沙箱 → LLM 代理（令牌鉴权）</text>
+</svg>
+
+<h3 id="s1-2">1.2 相对上一版设计的修订</h3>
+<p>读过 dsh-go 之后，上一版有 5 处假设被事实推翻或简化，这里明确列出，避免两份文档并存时产生歧义。</p>
+<table>
+<tr><th>#</th><th>上一版</th><th>本版</th><th>原因</th></tr>
+<tr><td>1</td><td><code>runtime-shim</code>：拉起 agent、翻译事件、提供文件 / 预览 / git</td><td><b>wsd</b>：只做文件、预览、git、变更监听，以及把 dshd 的 API 反代出来</td><td>dsh-go 自己就是 HTTP + SSE 服务，不需要被「拉起并翻译」</td></tr>
+<tr><td>2</td><td><code>AgentAdapter</code> 提供 CLI / HTTP / SDK 三种实现</td><td>只保留控制层里的 <code>AgentClient</code> 接口 + <code>DshClient</code> 一个实现</td><td>Agent 已确定是 dsh-go；接口保留是为了日后可替换，不再预建多实现</td></tr>
+<tr><td>3</td><td>每个 Run 下发一个短期令牌，Run 结束即失效</td><td>每个<b>沙箱</b>一个令牌，LLM 代理在每次请求时校验「该对话当前有活跃 Run」</td><td>dsh-go 的模型适配器按模型名缓存，密钥只在构造时读一次（<code>deps.go</code> 的 <code>newLLMResolver</code>），无法按 Run 换密钥。该校验仅缩短可用窗口；同时限制模型、用途、每 Run 额度和凭证有效期。共 UID 的生成应用仍可能在活跃期间滥用令牌，不能宣称与隔离的 Run 凭证等效</td></tr>
+<tr><td>4</td><td>首个模板 <code>fullstack-node</code>（Express + SQLite）</td><td>首个模板 <code>react-go-sqlite</code></td><td>dsh-go 内置技能库 <code>arch-design</code> 的锁定栈就是 React(Vite+TS) + Go 标准库 + SQLite/PostgreSQL，配套检查脚本也是按它写的。顺着走比对抗更快</td></tr>
+<tr><td>5</td><td>沙箱内 shim 把事件翻译为 AG-UI 子集后再上报</td><td>控制层存 dsh-go 的<b>原始事件</b>，在出口处映射为 UI 事件</td><td>协议演进只改映射代码，不用迁移历史数据；沙箱里少一层代码</td></tr>
+</table>
+<p>未变化的部分：隔离单元是「对话」；命令走 HTTP、事件走 SSE；控制层拉取沙箱事件流并用序号续传；预览使用独立可注册域名；GitHub 推送与发布留到 P1。</p>
+<h3 id="s1-3">1.3 本次合入的关键约束</h3>
+<table>
+<tr><th>约束</th><th>设计落点</th><th>P0 边界</th></tr>
+<tr><td>身份与归属</td><td>§5.1、§6：服务端签发测试账号会话；对话、文件、SSE、取消、预览票据统一校验 owner</td><td>SSO 可预留，可信用户身份不能预留；不接受客户端任意用户名头</td></tr>
+<tr><td>执行与取消一致性</td><td>§3.3 S7/S8、§5.3–5.4：唯一 Runtime、run_id 幂等接收、停止确认、finalizing</td><td>新 Run 不得与取消后的旧命令或上一轮提交重叠</td></tr>
+<tr><td>持久事件可靠交付</td><td>§3.3 S9、§5.5–5.6：顺序追加、事务去重、提交后扇出、终态补扫</td><td>至少一次接收＋事务去重；临时状态不保证重放</td></tr>
+<tr><td>资源与性能</td><td>§4.2/4.7、§5.11、§10.1：输出有界、三类配额、公平排队、快照构建</td><td>普通容器共享内核；同容器管理面与应用互隔离尚需额外机制</td></tr>
+</table>
+<p><b>非目标：</b>P0 不支持同对话并发修改、多人实时编辑或直接多机调度；不因未来扩展提前拆微服务、引入队列集群。每次增加组件都以明确瓶颈或隔离需求为依据。</p>
+
+<h2 id="s2">2. dsh-go 作为 Runtime：接口充分性评估</h2>
+<h3>2.1 dsh-go 现状（事实）</h3>
+<table>
+<tr><th>维度</th><th>现状</th><th>出处</th></tr>
+<tr><td>规模与质量</td><td>9294 行 Go；<code>go build</code> 通过；单元与 HTTP 集成测试全绿（agent、project、session、policy、tools、storejsonl、httpapi 等 12 个包）</td><td>本次实测</td></tr>
+<tr><td>分层</td><td>domain（entity / port / plugin）→ application（agent、session、project）→ infrastructure（openai、storejsonl、tools、policy、mcp、skill）→ interfaces（httpapi、webui）；<code>shared/deps</code> 为唯一组合根</td><td><code>README.md</code></td></tr>
+<tr><td>HTTP API</td><td>19 条 API 路由（另有内嵌 Web UI 的 <code>GET /</code>）：<code>healthz</code>、<code>plugins</code>、<code>models</code>（增删查）、<code>sessions</code>（建 / 列 / 查 / events / search / fork / messages / cancel / mode / approvals / stream）、<code>tickets</code>、<code>projects/plan</code>、<code>projects/plans/{id}</code></td><td><code>httpapi/server.go:44-65</code></td></tr>
+<tr><td>事件模型</td><td>4 类事件带原始 seq，SSE 支持 id/event/data 与游标回放；先订阅后补发只消除握手窗口，当前慢订阅仍丢事件、并发发布仍可能乱序</td><td><code>entity/message.go</code>、<code>server.go:362–434</code>、<code>manager.go:373–388</code></td></tr>
+<tr><td>回合控制</td><td>同一 Runtime 的 running mutex 拒绝重复回合，但冷恢复对象可能重复；turn marker 早于 running 复位，context 取消不杀 shell 命令，需 S7/S8 修复</td><td><code>session/manager.go:209–284</code>、<code>tools/bash.go:340–341</code></td></tr>
+<tr><td>存储</td><td>每会话 <code>header.json</code> + <code>events.jsonl</code>，只追加；内存镜像；<code>Manager.load</code> 懒恢复；上下文投影时补齐缺配对的 tool result</td><td><code>storejsonl/store.go</code>、<code>manager.go:394-449</code></td></tr>
+<tr><td>工具</td><td>bash（持久会话）、read_file、write_file（写后语法检查）、edit_file、glob、grep、run_tests、task（子代理）、use_skill；deploy 与 MCP 由配置决定是否启用</td><td><code>deps.go:87-150</code></td></tr>
+<tr><td>模型</td><td><code>LLMInfoRepo</code> 为文件实现（<code>models.yaml</code>）；OpenAI 兼容协议；<b>非流式</b>；单次调用超时看门狗；可重试错误（429 / 5xx / 超时）指数退避，401 / 400 快速失败</td><td><code>openai/client.go</code>、<code>loop.go:160-202</code></td></tr>
+<tr><td>安全</td><td>三档审批 + bash 语义风险解析；<code>allowed_cwd_roots</code> 工作区白名单；<b>bash 继承 dshd 全部环境变量</b>；文件工具不限制路径</td><td><code>policy.go</code>、<code>bash.go:195</code>、<code>common.go:34-43</code></td></tr>
+<tr><td>知识资产</td><td>9 个技能：<code>arch-design</code> 总引导 + 8 个专项；目录清单进系统提示词，正文经 <code>use_skill</code> 按需加载；含 5 个检查 / 冒烟脚本</td><td><code>skills/</code></td></tr>
+</table>
+
+<h3>2.2 需求对照表</h3>
+<p>下表以上一版 P0 的需求为准，逐条判断 dsh-go 现有接口是否足够。状态含义：<b style="color:var(--ok)">满足</b>＝直接可用；<b style="color:var(--warn)">部分</b>＝能用但有缺陷，需小修补或在控制层兜底；<b style="color:var(--bad)">缺失</b>＝没有。</p>
+<table>
+<tr><th>#</th><th>需求</th><th>dsh-go 现状</th><th>状态</th><th>处理</th></tr>
+<tr><td>R1</td><td>创建会话（工作目录 / 模式 / 模型）</td><td><code>POST /v1/sessions {cwd, mode, title, model}</code> → 201</td><td class="st ok">满足</td><td>每个沙箱内创建 1 个会话，<code>cwd=/workspace/app</code></td></tr>
+<tr><td>R2</td><td>异步发起回合，同会话互斥</td><td>热加载的同一 Runtime 返回 409；<code>Manager.load</code> 并发冷恢复可产生两个 Runtime，各自抢占 running</td><td class="st warn">部分</td><td>S7 保证会话对象唯一；S8 接收平台 run_id 并去重；数据库唯一键只约束活跃记录</td></tr>
+<tr><td>R3</td><td>取消回合</td><td><code>POST …/cancel</code> 只取消 context；<code>bash.go:340–341</code> 直接返回，不终止正在执行的 shell 命令</td><td class="st warn">部分</td><td>S8 增加 cancelling/stopped 确认；确认无旧写入者后才提交和释放闸门</td></tr>
+<tr><td>R4</td><td>实时事件流 + 断点续传</td><td><code>GET …/stream</code>，<code>id=seq</code>，<code>from_seq</code> / <code>Last-Event-ID</code></td><td class="st ok">满足</td><td>控制层作为单一消费者拉取</td></tr>
+<tr><td>R5</td><td>慢消费者不丢事件</td><td>缓冲 256 满后静默丢弃；并发 AppendEvent 的内存/SSE 顺序可能与磁盘顺序不同</td><td class="st warn">部分</td><td>S9 串行追加并使慢订阅断开；§5.6 连续性检查＋高水位/终态补扫，覆盖最后一条事件丢失</td></tr>
+<tr><td>R6</td><td>回合结束与失败判定</td><td>有 <code>turn_done / turn_failed</code>；marker 写入早于 running 复位，失败/取消也不证明子进程已停</td><td class="st warn">部分</td><td>marker 只触发收尾；S8 确认执行停止、checkpoint 完成后由控制层生成产品终态</td></tr>
+<tr><td>R7</td><td>回合用量（token、迭代数）</td><td>只有 <code>progress</code> marker 的自由文本；累计 token 仅在内存</td><td class="st warn">部分</td><td>计量以控制层 LLM 代理为准；S2 补结构化字段</td></tr>
+<tr><td>R8</td><td>工具调用成败标记</td><td>tool 消息只有 <code>content</code>；<code>IsError</code> 在写入事件时丢失</td><td class="st warn">部分</td><td>S2：在 <code>Event</code> 上增加 <code>is_error</code></td></tr>
+<tr><td>R9</td><td>历史回放</td><td><code>GET …/events?from_seq=</code>、<code>search</code></td><td class="st ok">满足</td><td>产品侧历史读控制层库，不依赖沙箱在线</td></tr>
+<tr><td>R10</td><td>创建会话时选模型</td><td><code>create.model</code> 经 <code>LLMInfoRepo</code> 解析</td><td class="st ok">满足</td><td>模型名使用控制层目录里的 <code>id</code></td></tr>
+<tr><td>R11</td><td>对话中途切换模型</td><td><code>Manager.SetModel</code> 已存在，但<b>没有 HTTP 路由</b>（只有编排器内部使用）</td><td class="st no">缺失</td><td>S1：新增 <code>POST /v1/sessions/{id}/model</code></td></tr>
+<tr><td>R12</td><td>模型密钥不进沙箱</td><td>密钥来自 <code>api_key_env</code> 或字面值，适配器构造时读取一次并缓存</td><td class="st warn">部分</td><td>沙箱内只配「代理地址 + 沙箱令牌」，真实密钥仅在控制层</td></tr>
+<tr><td>R13</td><td>流式文本输出</td><td>适配器非流式，SSE 推的是整条消息</td><td class="st no">缺失</td><td>S5：适配器流式 + 临时 <code>delta</code> 事件</td></tr>
+<tr><td>R14</td><td>代码浏览（文件树、读文件）</td><td>无任何文件列举或读取接口</td><td class="st no">缺失</td><td>wsd 提供 <code>/fs/tree</code>、<code>/fs/file</code></td></tr>
+<tr><td>R15</td><td>文件变更感知</td><td>无</td><td class="st no">缺失</td><td>wsd 监听文件系统（防抖）</td></tr>
+<tr><td>R16</td><td>预览（启动、守护、日志）</td><td>无</td><td class="st no">缺失</td><td>wsd 守护预览进程；S4 增加 <code>preview</code> 工具让 Agent 能自验证</td></tr>
+<tr><td>R17</td><td>每轮 commit / checkpoint</td><td>无；状态栏只读 git 状态，Agent 可自行 git 但无保证</td><td class="st no">缺失</td><td>wsd <code>/git/commit</code>，控制层在回合结束后触发</td></tr>
+<tr><td>R18</td><td>人工审批</td><td>三档模式 + <code>approvals</code> 接口 + 默认 5 分钟超时按拒绝</td><td class="st ok">满足</td><td>P0 固定 full-auto；P1 前端出审批卡片</td></tr>
+<tr><td>R19</td><td>默认审批模式</td><td><code>agent.default_mode</code> 被解析但<b>从未被使用</b>；会话 <code>mode</code> 为空时，钩子回落 <code>auto-edit</code>，高风险命令阻塞等审批</td><td class="st warn">部分</td><td>控制层创建会话时显式传 <code>full-auto</code>；S6 修复该配置项</td></tr>
+<tr><td>R20</td><td>持久化与恢复</td><td>JSONL 可恢复上下文；不恢复在途执行、审批或 shell 状态；日志没有逐条 fsync，进程内锁不支持多进程共写</td><td class="st warn">部分</td><td>S7/S8 保证恢复唯一性与在途确认；S10 明确刷盘/损坏恢复策略，同一日志仅一个 Runtime 进程写入</td></tr>
+<tr><td>R21</td><td>进程内多会话并发</td><td><code>Manager.runtimes</code> 多会话，每会话独立 bash</td><td class="st ok">满足</td><td>P0 一个容器只放 1 个会话</td></tr>
+<tr><td>R22</td><td>跨用户 / 跨对话隔离</td><td>只有进程组级隔离；无租户概念；文件工具可读写任意路径</td><td class="st no">缺失</td><td>每对话一个容器（沙箱）</td></tr>
+<tr><td>R23</td><td>子进程环境变量</td><td>bash 与 MCP 子进程继承 dshd 全部环境（<code>os.Environ()</code>）</td><td class="st no">缺失</td><td>S3：环境变量白名单；沙箱内不放敏感变量</td></tr>
+<tr><td>R24</td><td>项目约定与技能注入</td><td><code>system_prompt.md</code> + <code>skills/</code> 机制完整</td><td class="st ok">满足</td><td>平台约定写成 <code>platform-contract</code> 技能</td></tr>
+<tr><td>R25</td><td>技能内容与平台约定一致</td><td><code>arch-design</code> 默认 React + Go + PostgreSQL（超轻量场景 SQLite）；<code>deploy-ship</code> 引导写 Dockerfile / compose</td><td class="st warn">部分</td><td>以 SQLite 分支为默认，用 <code>platform-contract</code> 覆盖冲突项</td></tr>
+<tr><td>R26</td><td>健康检查</td><td><code>GET /healthz</code></td><td class="st ok">满足</td><td>wsd 聚合后对外</td></tr>
+<tr><td>R27</td><td>图片 / 附件输入</td><td><code>messages</code> 只接受 <code>content</code> 字符串</td><td class="st no">缺失</td><td>P1</td></tr>
+<tr><td>R28</td><td>多用户身份与鉴权</td><td>单一 Bearer 令牌，无用户概念</td><td class="st no">缺失</td><td>上移控制层（设计如此，不是缺陷）</td></tr>
+<tr><td>R29</td><td>token 预算口径</td><td>预算按「会话生命周期累计」判定，存内存、不随回合重置（<code>AddTokens</code> 累加，<code>loop.go:103-109</code>）；重启后清零</td><td class="st warn">部分</td><td>S6：改为「每回合预算」；用量上限由控制层按用户 / 对话管理</td></tr>
+</table>
+
+<h3>2.3 对「简化 Runtime」的直接含义</h3>
+<ul>
+<li><b>8 项满足、11 项部分满足、10 项未提供</b>：接口形态继续复用，但异步发起、取消、终态与持久恢复已由「满足」修订为「部分」，需要 S7–S10 加固。能力数量只描述功能覆盖，不代表生产准入。</li>
+<li><b>R14–R17 由 wsd 承接</b>，dsh-go 保持 Agent 内核；wsd 只做工作区确定性操作、执行监督与轻量控制，不加入租户或发布编排。</li>
+<li><b>R22、R23 联合处理</b>：每对话容器负责跨对话边界，环境白名单减少继承泄漏；同 UID 的进程仍可读模型文件或访问管理面，需额外的执行身份或预览容器隔离。</li>
+<li><b>R11、R13 是体验项</b>：切换模型是产品功能；流式输出决定「等一两分钟没动静」的体感，建议在 P0 主链路跑通后第一时间补上，不阻塞首版。</li>
+</ul>
+
+<h2 id="s3">3. 抽离与改造：控制层承担什么，dsh-go 改什么</h2>
+<h3>3.1 从 Runtime 抽离到控制层的功能（10 项）</h3>
+<table>
+<tr><th>#</th><th>功能</th><th>dsh-go 现状</th><th>抽离后</th><th>收益</th></tr>
+<tr><td>1</td><td>模型目录与真实密钥</td><td><code>models.yaml</code> + 环境变量，<code>POST /v1/models</code> 可增删</td><td>控制层模型目录；沙箱内只有一份由 wsd 启动时生成的 <code>models.yaml</code>，指向控制层 LLM 代理，密钥字段为沙箱令牌</td><td>真实 Key 不出控制层；换模型 / 换供应商不碰沙箱</td></tr>
+<tr><td>2</td><td>LLM 协议转换与供应商差异</td><td>仅支持 OpenAI 兼容协议</td><td>LLM 代理对外说 OpenAI 协议，对上游按供应商转换</td><td>Runtime 永远只讲一种协议</td></tr>
+<tr><td>3</td><td>用户身份与鉴权</td><td>单 Bearer，ticket 机制</td><td>控制层 <code>AuthProvider</code>（P0 预配账号＋服务端会话，后续 SSO）；Runtime 管理接口只对受控执行身份开放。回环地址不构成容器内认证</td><td>Runtime 没有「用户」概念</td></tr>
+<tr><td>4</td><td>会话索引与列表、标题、归属</td><td><code>GET /v1/sessions</code> 扫目录</td><td>控制层 <code>t_conversation</code></td><td>列表不必唤醒沙箱；多用户查询走索引</td></tr>
+<tr><td>5</td><td>面向浏览器的事件存储与扇出</td><td>事件日志既是 Agent 的记忆也是 UI 数据；SSE 直连浏览器</td><td>Runtime 日志只做 Agent 上下文；控制层 <code>t_event</code> 负责历史与多端扇出</td><td>沙箱停止 / 删除后历史仍可看；Runtime 只有一个 SSE 消费者</td></tr>
+<tr><td>6</td><td>并发闸门与配额</td><td>仅会话级忙检测（进程内）</td><td>唯一索引约束单对话活跃记录，执行增加 run_id 幂等；活跃 Run、在线沙箱与构建分别限额，按用户轮转排队</td><td>P0 单实例；多副本前补租约/fencing 和跨实例订阅；配额按压测定值</td></tr>
+<tr><td>7</td><td>沙箱生命周期</td><td>无（进程常驻）</td><td>控制层创建 / 停止 / 恢复 / 回收</td><td>Runtime 不关心自己在哪台机器</td></tr>
+<tr><td>8</td><td>审批的人机界面</td><td>事件 + <code>approvals</code> 接口</td><td>P0 固定 full-auto；P1 控制层透传事件、前端出卡片</td><td>P0 不会因无人审批而卡住</td></tr>
+<tr><td>9</td><td>规划 → 编码编排</td><td><code>project.Orchestrator</code>，状态在内存，重启丢失</td><td>P1 由控制层按「建会话 → 发规划 → 等 <code>turn_done</code> → fork → 发编码」驱动，状态入库</td><td>编排状态可恢复、可观测</td></tr>
+<tr><td>10</td><td>部署与 GitHub 凭证</td><td><code>deploy</code> 工具 + 命令模板，运行在会话里</td><td>P0 不配置 <code>deploy.targets</code>（工具不注册）；P1 由控制层 <code>Deployer</code> / <code>GitService</code> 持有凭证</td><td>沙箱内永远没有发布类凭证</td></tr>
+</table>
+<p><b>仍留在 Runtime 的：</b>ReAct 循环及其护栏、全部工具、上下文压缩与 spill、会话日志（Agent 记忆）、技能机制、命令风险解析（作为纵深防御保留）。</p>
+
+<h3>3.2 dsh-go 的使用方式：用什么、不用什么</h3>
+<table>
+<tr><th>类别</th><th>项目</th></tr>
+<tr><td>P0 使用</td><td>会话创建、发消息、取消、SSE 流、事件回放（恢复用）、健康检查；bash / 文件 / glob / grep / run_tests / task / use_skill；技能库；上下文压缩；审批机制（固定 full-auto，保留代码路径）</td></tr>
+<tr><td>P0 不使用（配置关闭或不调用）</td><td><code>/v1/models</code> 增删（由控制层目录取代）、<code>/v1/tickets</code>、<code>/v1/projects/*</code>、<code>fork</code>、<code>search</code>、内嵌 Web UI、MCP、<code>deploy</code> 工具</td></tr>
+<tr><td>P1 启用</td><td>审批卡片、<code>fork</code>（配合 git checkpoint 做「回到这一轮」）、MCP、规划编排（迁到控制层）</td></tr>
+</table>
+
+<h3>3.3 对 dsh-go 的改造清单</h3>
+<p>保留 S1–S6 的功能增量，新增 S7–S10 的可靠性加固。以下旧规模仅为局部接口粗估，<b>不包含并发恢复、取消执行树、幂等状态与专项测试成本</b>；不再以约 500 行承诺完整改造。保留 ReAct 思路和工具能力，但允许修正会话、事件和执行生命周期代码。</p>
+<table>
+<tr><th>编号</th><th>改动</th><th>位置</th><th>规模</th><th>解决</th><th>优先级</th></tr>
+<tr><td>S1</td><td>新增 <code>POST /v1/sessions/{id}/model</code>，调用现成的 <code>Manager.SetModel</code>；下一个回合生效，回合中调用返回 409</td><td><code>httpapi/server.go</code></td><td>约 20 行 + 测试</td><td>R11</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td>S2</td><td>事件元数据：① <code>turn_done</code> / <code>turn_failed</code> marker 增加结构化字段 <code>{iterations, tokens, model}</code>；② tool 消息对应的事件增加 <code>is_error</code></td><td><code>entity/message.go</code>、<code>agent/loop.go</code>、<code>session/manager.go</code></td><td>约 40 行</td><td>R7、R8</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td>S3</td><td>bash 与 MCP 子进程环境变量白名单：新增 <code>tools.env_allowlist</code>，默认只透传 <code>PATH HOME LANG TERM PORT</code> 与配置项指定的变量</td><td><code>tools/bash.go</code>、<code>mcp/client.go</code>、<code>config</code></td><td>约 30 行</td><td>R23</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td>S4</td><td>新增 <code>preview</code> 工具：调用 wsd 的 <code>POST /preview/ensure?wait=90</code>，返回预览状态、HTTP 探活结果与日志尾部 200 行；在策略钩子中登记为低风险</td><td><code>tools/preview.go</code>、<code>deps.go</code>、<code>policy.go</code></td><td>约 120 行</td><td>R16；让 Agent 能「启动 → 看日志 → 修复」闭环</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td>S5</td><td>LLM 流式：适配器增加 <code>ChatStream</code>；循环在生成期间发出<b>仅广播、不落盘</b>的 <code>delta</code> 事件；最终仍落一条完整 assistant 消息</td><td><code>openai/client.go</code>、<code>port.LLMPort</code>、<code>loop.go</code>、<code>manager.go</code></td><td>约 250 行</td><td>R13</td><td><span class="tag p1">P0 之后第一个迭代</span></td></tr>
+<tr><td>S6</td><td>① 让 <code>agent.default_mode</code> 真正生效；② token 预算改为「每回合」口径；③ 新增 <code>server.disable_webui</code> 与 <code>server.disable_model_api</code> 开关</td><td><code>deps.go</code>、<code>session/manager.go</code>、<code>httpapi</code></td><td>约 40 行</td><td>R19、R29</td><td><span class="tag p0">P0</span></td></tr>
+</table>
+<p>S4 将启动、探活和日志统一交给 wsd，避免 Agent 通过持久 bash 后台运行预览；执行组与预览组必须分开。该工具在活跃 Run 内调用时沿用该 Run 的工作区执行锁，<b>不重复申请非重入锁</b>，否则会死锁。</p>
+<h3 id="s3-4">3.4 专题提炼：多人 P0 前置改造（S7–S10）</h3>
+<table>
+<tr><th>编号</th><th>优化项</th><th>实现落点</th><th>验收门槛</th></tr>
+<tr><td>S7</td><td>会话唯一实例与线程安全</td><td><code>Manager.load</code> 按 SessionID singleflight 或写回前二次查重，始终返回同一对象；Model/Mode 使用受锁快照。Fork 明确复制模型，配合代码快照；子代理只隔离上下文</td><td>冷恢复并发取同会话得到同一 Runtime；双发只启动一次；<code>go test -race</code> 专项通过</td></tr>
+<tr><td>S8</td><td>Run 幂等接收、查询与可靠取消</td><td>在 Runtime 内持久记录 run_id、payload_hash、执行阶段与日志区间；相同请求重复返回原任务，响应未知先查询；取消终止并回收执行树、隔离旧输出，终态确认前不释放活跃位</td><td>202 响应丢失重试不重复；取消后无后台写入；终止不误杀预览；无法确认则停止整个对话容器并恢复</td></tr>
+<tr><td>S9</td><td>顺序事件与可靠续传</td><td>单会话追加锁/单写者覆盖持久化→内存→广播；满缓冲断开慢订阅，游标回放；控制层提交后扇出，并周期检查高水位和末尾终态</td><td>并行工具不会产生日志/上下文乱序；1000 事件慢订阅可补齐；末尾事件无后续消息也能发现</td></tr>
+<tr><td>S10</td><td>输出、文件、日志和进程资源有界</td><td>有界头尾缓存＋流式 spill；传播 Scanner 错误并回收 Pipe/shell；仅对明确未执行的命令重试；文件/搜索设大小、累计字节和 ctx 上限；关闭会话/子代理 shell，日志轮转与持久 writer 定义 Sync 窗口</td><td>大输出不全量累积；5 MB 单行错误后无旧进程残留；GC 后堆与 FD 可回落；磁盘满有拒绝/告警</td></tr>
+</table>
+<p><b>实现优先级：</b>S7、S8、S9 及 S10 的内存/进程上限属于多人准入门槛；日志批量刷盘和高级搜索优化由性能数据触发。完整证据在专题中，当前 Go 普通测试通过尚未验证上述专项。</p>
+
+<h2 id="s4">4. Runtime 层设计</h2>
+<h3>4.1 功能与模块</h3>
+<table>
+<tr><th>模块</th><th>进程</th><th>职责</th></tr>
+<tr><td>wsd</td><td>PID 1，监听容器 IP:7000</td><td>启动编排（拉配置、写文件、初始化工作区、拉起 dshd）；反代 dshd；文件树与读文件；预览进程守护；git 提交；文件变更与预览状态事件</td></tr>
+<tr><td>dshd（dsh-go）</td><td>wsd 子进程，127.0.0.1:3080</td><td>Agent 内核，仅承载 1 个会话</td></tr>
+<tr><td>生成的应用</td><td>wsd 子进程组，监听 0.0.0.0:3000（容器网络内，控制层预览代理直连）</td><td>由 <code>start.sh</code> 启动，监听 <code>$PORT</code></td></tr>
+</table>
+
+<h3>4.2 容器规格</h3>
+<table>
+<tr><th>项</th><th>设计</th></tr>
+<tr><td>镜像内容</td><td>Go 工具链、Node 20、git、python3（技能检查脚本用）、<code>dshd</code>、<code>wsd</code>、<code>/opt/dsh/skills</code>、<code>/opt/dsh/system_prompt.md</code>、<code>/opt/templates/react-go-sqlite</code>（含已预装的 <code>node_modules</code> 与 Go 模块缓存）。镜像带版本号，记录在 <code>t_sandbox.Fimage_ver</code></td></tr>
+<tr><td>运行用户</td><td>非 root（uid 10001）；<code>--cap-drop ALL</code>、<code>--security-opt no-new-privileges</code>；不挂宿主目录与 docker.sock；不开 privileged</td></tr>
+<tr><td>资源</td><td>1 CPU、2 GB 内存、PID 512 为初值，不代表验证容量；按环境配置 swap。磁盘/文件数需硬配额，巡检仅作告警；输出/日志/FD/watchers 分别有界；Go 构建并行度和 GOMAXPROCS 按 cgroup 配置，统一构建信号量限制峰值</td></tr>
+<tr><td>目录</td><td><code>/workspace/app</code>（项目，Git 仓库）、<code>/workspace/.dsh/data</code>（会话日志与 spill）、<code>/workspace/.dsh/models.yaml</code>（启动时生成）。<code>.dsh</code> 不进 Git，也不在文件树中展示</td></tr>
+<tr><td>网络</td><td>专用 bridge 网络，禁止容器间互通；出站只放行控制层 LLM 代理与内部包镜像（<code>GOPROXY</code>、npm registry）。P0 可用 <code>DOCKER-USER</code> 链规则实现，P1 改为带白名单的转发代理</td></tr>
+<tr><td>端口</td><td>不发布到宿主；控制层通过容器 IP 访问 <code>:7000</code>（wsd）和 <code>:3000</code>（生成的应用，仅预览代理使用，见 §5.9）</td></tr>
+<tr><td>环境变量</td><td>S3 白名单仅减少子进程直接继承；<code>models.yaml</code>、同 UID 的进程信息或管理接口仍可能暴露凭证。长期 Key 留控制层；沙箱令牌必须绑定用途、模型、运行期额度与有效期，可吊销；不能把「三个环境变量」作为秘密不可读的证明</td></tr>
+</table>
+
+<h3>4.3 启动时序</h3>
+<ol>
+<li>wsd 启动，读取 <code>SANDBOX_ID</code>、<code>CP_BASE_URL</code>、<code>LLM_PROXY_TOKEN</code>。</li>
+<li><code>GET {CP}/internal/sandbox/config</code>（令牌鉴权）→ 返回模型目录、默认模型、Agent 限额、系统提示追加段。</li>
+<li>生成 <code>/workspace/.dsh/models.yaml</code>：每个目录模型一条，<code>base_url</code> 指向 <code>{CP}/llm/v1</code>，<code>api_key_env=LLM_PROXY_TOKEN</code>，其中一条 <code>default: true</code>。</li>
+<li>若 <code>/workspace/app</code> 为空：从 <code>/opt/templates/{template}</code> 复制，<code>git init</code>，提交初始版本。已有内容则跳过（幂等）。</li>
+<li>生成 <code>dsh.yaml</code>（见 §4.4），启动 dshd，轮询其 <code>/healthz</code>。</li>
+<li>启动文件监听；开放 <code>:7000</code>，<code>/healthz</code> 变为 200。控制层此时才认为沙箱就绪。</li>
+</ol>
+
+<h3>4.4 dsh.yaml（沙箱配置）</h3>
+<pre>server:
+  listen: "127.0.0.1:3080"      # 回环只限制外部网络；同容器应用也可能访问，需 §4.7 管理面隔离
+  disable_webui: true            # S6
+  disable_model_api: true        # S6
+security:
+  allowed_cwd_roots: ["/workspace"]
+models_file: "/workspace/.dsh/models.yaml"
+skills_dir: "/opt/dsh/skills"
+storage:
+  data_dir: "/workspace/.dsh/data"
+agent:
+  max_iterations: 80             # 初值；原型构建通常比 50 轮更长，需按真实任务调整
+  token_budget: 800000           # S6 之后按每回合计；初值，需压测
+  default_mode: full-auto        # S6 之后生效；控制层仍显式传 mode
+  system_prompt_file: "/opt/dsh/system_prompt.md"
+  context_compress_at_percent: 70
+tools:
+  bash_timeout_seconds: 300      # npm ci / go build 可能较慢；Agent 仍可单次覆盖
+  env_allowlist: ["PATH","HOME","LANG","TERM","PORT","GOPROXY","GOFLAGS","npm_config_registry"]   # S3
+# 不配置 deploy.targets 与 mcp.servers：对应工具不注册</pre>
+
+<h3>4.5 wsd 接口（容器内 :7000，目标为仅受控管理链路可达）</h3>
+<p>此可达性属于网络/执行身份的待验证约束，不由端口或反代白名单自动保证。管理凭证与文件必须对生成应用不可读；共 UID 试点不满足同容器的强管理面隔离。</p>
+<table>
+<tr><th>方法与路径</th><th>说明</th><th>响应要点</th></tr>
+<tr><td><code>GET /healthz</code></td><td>wsd 与 dshd 就绪检查，只代表可服务；执行是否停止由具体 Run 查询确认，不用 healthz 推断</td><td><code>{agent:"ok", workspace:"ok", image:"v3"}</code></td></tr>
+<tr><td><b>新增管理执行契约（S8）</b>：<code>POST /agent/sessions/{sid}/runs</code>、<code>GET /agent/sessions/{sid}/runs/{rid}</code>、<code>POST /agent/sessions/{sid}/runs/{rid}/cancel</code></td><td>接收 <code>{run_id, content, payload_hash, model, generation}</code> 只持久准备（不启动推理）；增加幂等 <code>POST /agent/sessions/{sid}/runs/{rid}/start</code>。控制层先提交running授权再start，防首次LLM请求被dispatching拒绝；取消撤销准备任务或停止执行。重复输入返回原任务，不同hash返回409；未知响应先查询，stopped_confirmed后解锁</td><td><code>{run_id, status, stopped_confirmed, epoch, next_seq, checkpoint_status}</code>；属于待实现 API，不能仅包装旧 messages 就宣称幂等</td></tr>
+<tr><td><code>ANY /agent/**</code></td><td>去掉 <code>/agent</code> 前缀后反代到 dshd 的 <code>/v1/**</code>；SSE 不缓冲、不压缩；仅放行控制层需要的路径（<code>sessions</code>、<code>sessions/{id}/(runs|model|stream|events)</code>（含 Run 准备/start/状态/取消和高水位查询）），其余返回 404</td><td>透传状态码（409 等）</td></tr>
+<tr><td><code>GET /fs/tree?path=&amp;depth=1</code></td><td>列目录一层；忽略 <code>.git</code>、<code>.dsh</code>、<code>node_modules</code>、<code>dist</code>、<code>bin</code>、<code>*.sqlite</code>；路径规范化后必须在 <code>/workspace/app</code> 内</td><td><code>[{name, path, type, size, mtime}]</code></td></tr>
+<tr><td><code>GET /fs/file?path=&amp;max=1048576</code></td><td>基于固定项目 root 安全打开，防符号链接和检查/打开竞争；stat 后有界读取，max 被服务端硬上限约束；二进制只回元信息，超限返回 413 或受限分页</td><td><code>{path, size, binary, truncated, content, etag}</code></td></tr>
+<tr><td><code>GET /events</code> (SSE)</td><td>仅发尽力而为的状态通知，<b>不支持重放</b>；控制层断线重连后用 <code>/fs/tree</code> 和 <code>/preview/status</code> 对齐状态</td><td><code>file_changed {paths[]}</code>、<code>preview_status {status, restarts}</code>、<code>committed {commit}</code></td></tr>
+<tr><td><code>POST /preview/ensure?wait=90</code></td><td>输入包含 commit 或 workspace_generation；相同版本幂等；快照构建取得构建名额，live 模式与Run工作区门控串行，Run内S4调用复用执行权。过期预览不得替换更新版本</td><td><code>{status, commit, generation, url_path, probe:{code, ms}, log_tail}</code></td></tr>
+<tr><td><code>POST /preview/restart</code>、<code>GET /preview/status</code>、<code>GET /preview/logs?tail=200</code></td><td>手动重启、状态、日志</td><td>状态：<code>none / starting / ready / failed</code></td></tr>
+<tr><td><code>POST /git/commit {run_id, generation, message}</code></td><td>确认该 Run 执行停止并持工作区门控后提交；每 run_id 保存 checkpoint 结果，重试返回原 commit，无变更返回既有HEAD；未知旧执行时拒绝，不允许新 Run 混入</td><td><code>{commit, changed, files[≤50], checkpoint_status}</code></td></tr>
+<tr><td><code>GET /git/log?limit=</code></td><td>提交列表</td><td><code>[{commit, message, time}]</code></td></tr>
+<tr><td><span class="tag p1">P1</span> <code>POST /git/push</code>、<code>GET /git/archive</code></td><td>推送时由控制层在请求体里临时带令牌，wsd 用完即丢；归档给发布流程取产物</td><td>—</td></tr>
+</table>
+<p><b>预览守护规则：</b>wsd 在独立预览执行组运行 <code>start.sh</code>（PORT=3000）；只回收 supervisor 登记的预览进程，不盲杀端口占用者，未知占用返回 <code>PORT_CONFLICT</code>。探活首页需 200 或约定健康端点的明确成功值，401/404 不能冒充可用原型；90 秒为待测超时初值。最多重启 3 次，日志同时限制行数和总字节。构建绑定 commit/workspace_generation；live workspace 模式由执行门控串行化，快照模式可以在新 Run 开始后异步构建。</p>
+
+<h3>4.6 项目约定与模板：<code>react-go-sqlite</code></h3>
+<p>目的是让 Agent 不用做技术选型，预览也不用猜怎么启动。约定同时通过两处下发：模板里的文件，以及 <code>platform-contract</code> 技能（目录清单进系统提示词，Agent 动手前加载正文）。</p>
+<table>
+<tr><th>约定</th><th>内容</th></tr>
+<tr><td>目录</td><td><code>web/</code>（Vite + React + TS，按 feature 组织）、<code>cmd/server/</code> 与 <code>internal/</code>（Go 标准库 ServeMux，按域分包）、<code>data/</code>（SQLite 文件，已 <code>.gitignore</code>）、<code>start.sh</code>、<code>AGENTS.md</code></td></tr>
+<tr><td>启动</td><td><code>start.sh</code> 构建前端、静态编译 Go（<code>CGO_ENABLED=0</code>，SQLite 用纯 Go 驱动）、<code>exec</code> 服务；监听 <code>0.0.0.0:$PORT</code>；<code>/api/v1/*</code> 为接口，其余为 <code>web/dist</code> 静态资源并带 SPA 回退；<code>GET /</code> 必须返回 200</td></tr>
+<tr><td>数据</td><td>默认 SQLite；确需外部服务时必须在回复里说明，并更新 <code>AGENTS.md</code></td></tr>
+<tr><td>禁止</td><td>不要自己后台启动服务占用 3000 端口（用 <code>preview</code> 工具）；不要运行 <code>docker</code> / <code>docker compose</code>（沙箱内没有）；不要修改 <code>.git</code>；密钥不入前端与仓库</td></tr>
+<tr><td>验证门禁</td><td>构建通过 → <code>go test ./...</code> → 调用 <code>preview</code> 工具并确认探活 200 → 冒烟核心接口</td></tr>
+<tr><td>与现有技能的关系</td><td>保留全部 9 个技能；<code>platform-contract</code> 声明「冲突时以本技能为准」：数据库取 SQLite、不执行 docker、预览用 <code>preview</code> 工具；<code>deploy-ship</code> 中的 Dockerfile / compose 产物仍可生成（P1 发布时有用），但不在沙箱内运行</td></tr>
+</table>
+<pre>#!/usr/bin/env bash
+# start.sh —— 平台预览入口（模板自带，Agent 可改内容但需保持约定）
+set -euo pipefail
+cd "$(dirname "$0")"
+export PORT="${PORT:-3000}"
+( cd web &amp;&amp; { [ -d node_modules ] || npm ci --no-audit --no-fund; } &amp;&amp; npm run build )
+CGO_ENABLED=0 go build -o bin/server ./cmd/server
+exec ./bin/server</pre>
+<p>首次预览需要前端构建 + Go 编译，约十几秒到数十秒（取决于缓存是否预热，待压测）。后续优化方向：前端用开发服务器 + 代理以获得秒级热更新；仅当源码变化时才重新构建。</p>
+
+<h3 id="s4-7">4.7 沙箱边界与演进：跨对话隔离不等于同容器管理面隔离</h3>
+<table>
+<tr><th>边界</th><th>P0 约束</th><th>验证/演进</th></tr>
+<tr><td>用户与对话</td><td>每对话独立可写卷、上下文与产品数据；相同用户的两个对话也不共享卷；共享依赖缓存只读</td><td>两个用户各两个对话，交叉读取、写入和预览访问均失败；Fork 除复制上下文，还需独立代码快照</td></tr>
+<tr><td>执行和预览</td><td>同容器试点是低成本取舍：分离执行组以免超时杀预览，但同 UID 仍可相互读配置/发信号/访问回环</td><td>面向不可信生成程序时拆执行身份与受控 UDS，或独立预览容器（源码只读快照、产品数据单独卷）；不同身份仍需验证权限和网络</td></tr>
+<tr><td>网络与依赖</td><td>默认拒绝东西向、宿主/数据库/元数据及非白名单出站；只开放指定模型代理和包源；bridge 不构成策略证明</td><td>验证 IPv4/IPv6、DNS、host gateway 和策略重载；包安装脚本按不可信代码执行，禁止接触平台凭证</td></tr>
+<tr><td>宿主与管理</td><td>固定允许的镜像、挂载和 SandboxSpec，不允许 privileged、host namespace 或宿主目录；沙箱不持有 Docker socket</td><td>Docker 驱动权限收敛；共享内核残余风险不因上 K8s 自动消除，必要时评估 gVisor/Kata</td></tr>
+<tr><td>内存、磁盘和回收</td><td>取消必须回收 Run 执行树；超长输出/Scanner 错误统一关闭 pipe 和旧 shell；预览不依赖 Agent bash 后台作业</td><td>无法确认停止时停止该对话整容器并保留卷；空闲回收使用 stop 而不是 pause；会话/子代理关闭需清 shell、spill、fd 和缓存</td></tr>
+</table>
+<p><b>full-auto 的边界：</b>只在硬隔离约束内免交互审批，不能免除根路径访问、管理 API、凭证和网络策略。<code>allowed_cwd_roots</code> 是初始目录校验，不是工具访问沙箱；路径 clean、环境白名单和提示词也不能替代操作系统访问控制。</p>
+
+<h2 id="s5">5. 控制层设计</h2>
+<h3>5.1 功能与模块</h3>
+<table>
+<tr><th>包</th><th>职责</th><th>关键接口 / 说明</th><th>期次</th></tr>
+<tr><td><code>auth</code></td><td>解析请求身份</td><td><code>AuthProvider.Authenticate(r) (userID, err)</code>；多人 P0 预配账号/邀请码＋服务端会话 cookie，不信任浏览器任意用户名头；后续换 SSO，所有接口统一 owner 校验</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>conversation</code></td><td>对话与消息的增删查，归属校验</td><td>所有查询强制带 <code>user_id</code>；越权统一返回 404</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>run</code></td><td>Run 编排：抢闸门、确保沙箱、下发消息、消费事件流、收尾</td><td><code>Service.Start / Cancel</code>；<code>Consumer</code>（带缺口检测）；<code>PostRun</code></td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>event</code></td><td>事件分配序号、落库、扇出、出口映射</td><td><code>Hub.Publish / Subscribe</code>；<code>Mapper.ToUI(rtEvent)</code></td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>sandbox</code></td><td>沙箱生命周期与配额</td><td><code>Driver</code> 接口 + <code>docker</code> 实现；<code>Manager.Ensure / Stop / Reap</code>；信号量与 LRU 淘汰</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>agentclient</code></td><td>与 Runtime 通信</td><td><code>AgentClient</code>（会话 / 消息 / 取消 / 切模型 / 流）+ <code>WorkspaceClient</code>（树 / 文件 / 预览 / 提交）；P0 各一个实现，经 wsd</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>files</code></td><td>代码浏览服务</td><td>在 <code>WorkspaceClient</code> 之上再做一次路径与大小校验；停止的沙箱按需唤醒</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>preview</code></td><td>预览域名入口与反代</td><td>Host → 对话；签名票据换 Cookie；WebSocket 升级；沙箱停止时返回「唤醒中」页</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>llm</code></td><td>模型目录、LLM 代理、用量</td><td><code>Catalog</code>（YAML）、<code>Proxy</code>（OpenAI 协议入口）、<code>Usage</code>（写 <code>t_llm_usage</code>）</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>store</code></td><td>MySQL 访问</td><td>仓储接口 + 事务封装</td><td><span class="tag p0">P0</span></td></tr>
+<tr><td><code>git</code> / <code>deploy</code></td><td>GitHub 推送、一键发布</td><td><code>GitService</code>、<code>Deployer</code> 接口与表已预留，路由返回 501</td><td><span class="tag p1">P1</span></td></tr>
+</table>
+
+<h3>5.2 对外 API</h3>
+<p>所有 <code>/api/*</code> 都经过 <code>AuthProvider</code>。错误统一为 <code>{"error":{"code","message"}}</code>。</p>
+<table>
+<tr><th>方法与路径</th><th>请求</th><th>成功响应</th><th>主要错误</th></tr>
+<tr><td><code>GET /api/me</code></td><td>—</td><td><code>{user_id}</code></td><td>401</td></tr>
+<tr><td><code>GET /api/models</code></td><td>—</td><td><code>[{id, name, tags[], desc, default}]</code>（不含地址与密钥）</td><td>—</td></tr>
+<tr><td><code>POST /api/conversations</code></td><td><code>{title?, model?, template?}</code></td><td>201 <code>{id, title, model, status:"idle", created_at}</code>（只写库，不建沙箱）</td><td>400 <code>BAD_MODEL</code>；429 <code>CONV_LIMIT</code></td></tr>
+<tr><td><code>GET /api/conversations?cursor=&amp;limit=</code></td><td>—</td><td><code>[{id, title, model, status, last_active, run?}]</code>；<code>status</code>：<code>idle / queued / running / error</code></td><td>—</td></tr>
+<tr><td><code>GET /api/conversations/{cid}</code></td><td>—</td><td>详情：<code>sandbox{status}</code>、<code>preview{status}</code>、<code>last_seq</code>、<code>active_run?</code></td><td>404</td></tr>
+<tr><td><code>PATCH /api/conversations/{cid}</code></td><td><code>{title?, model?}</code></td><td>200；模型在下一个 Run 前生效</td><td>400；409（Run 进行中不可改模型）</td></tr>
+<tr><td><code>DELETE /api/conversations/{cid}</code></td><td>—</td><td>204；逻辑删除，沙箱与卷延迟回收</td><td>404</td></tr>
+<tr><td><code>POST /api/conversations/{cid}/messages</code></td><td><code>{client_request_id, content, model?}</code>；平台对规范化输入计算 payload_hash</td><td>202 <code>{run_id, message_id, seq, status}</code>；相同请求号和内容返回同一 Run</td><td>409 <code>RUN_IN_PROGRESS / IDEMPOTENCY_CONFLICT</code>；429 <code>QUOTA_EXCEEDED</code>；400 <code>EMPTY / TOO_LONG</code></td></tr>
+<tr><td><code>GET /api/conversations/{cid}/runs/{rid}</code></td><td>—</td><td><code>{status, checkpoint_status, commit, error_code}</code>；用于响应未知/终态丢失后对账</td><td>404（统一 owner 校验）</td></tr>
+<tr><td><code>POST /api/conversations/{cid}/runs/{rid}/cancel</code></td><td>—</td><td>202 <code>{status:"cancelling"}</code>，只确认受理；重复取消返回同一状态</td><td>404；已结束时返回现有终态，不再启动取消</td></tr>
+<tr><td><code>GET /api/conversations/{cid}/messages?before=&amp;limit=</code></td><td>—</td><td><code>[{id, role, content, run_id, created_at}]</code></td><td>404</td></tr>
+<tr><td><code>GET /api/conversations/{cid}/events</code> (SSE)</td><td><code>?after=</code> 或 <code>Last-Event-ID</code></td><td>先登记订阅再按高水位分页补发，交集按事件标识去重；持久游标只前进不回退；每 15 秒心跳并补查末尾</td><td>404；慢消费者主动断开，重连继续补发</td></tr>
+<tr><td><code>GET /api/conversations/{cid}/events/history?after=&amp;limit=</code></td><td>—</td><td>JSON 批量，供首屏加载</td><td>404</td></tr>
+<tr><td><code>GET /api/conversations/{cid}/files/tree?path=</code></td><td>—</td><td>同 wsd；停止的沙箱会被唤醒</td><td>400 <code>BAD_PATH</code>；503 <code>SANDBOX_STARTING</code></td></tr>
+<tr><td><code>GET /api/conversations/{cid}/files/content?path=</code></td><td>—</td><td>同 wsd</td><td>400；404；413 <code>TOO_LARGE</code></td></tr>
+<tr><td><code>GET /api/conversations/{cid}/preview</code></td><td>—</td><td><code>{status, url, commit}</code>；短期票据绑定对话、具体 Host 和 nonce，一次性消费</td><td>404；Cookie 禁用时前端提供新窗口打开</td></tr>
+<tr><td><code>POST /api/conversations/{cid}/preview/restart</code></td><td>—</td><td>202</td><td>409（Run 进行中）</td></tr>
+<tr><td><span class="tag p1">P1</span> <code>POST …/git/push</code>、<code>POST …/deployments</code>、<code>GET …/deployments/{did}</code></td><td>—</td><td>P0 返回 501</td><td>—</td></tr>
+</table>
+<h4>内部接口（仅沙箱可达，令牌鉴权）</h4>
+<table>
+<tr><th>方法与路径</th><th>说明</th></tr>
+<tr><td><code>GET /internal/sandbox/config</code></td><td>wsd 启动时拉取：模型目录、默认模型、Agent 限额、系统提示追加段</td></tr>
+<tr><td><code>POST /llm/v1/chat/completions</code>、<code>GET /llm/v1/models</code></td><td>OpenAI 兼容入口，详见 §5.8</td></tr>
+</table>
+
+<h3>5.3 Run 状态机与并发闸门</h3>
+<table>
+<tr><th>状态</th><th>含义</th><th>进入</th><th>退出</th></tr>
+<tr><td><code>queued</code></td><td>等沙箱配额或启动</td><td>消息已接收，闸门抢占成功</td><td>沙箱就绪 → dispatching；明确尚未下发时取消/超时 → finalizing（记录未执行），再进入对应终态</td></tr>
+<tr><td><code>dispatching</code></td><td>执行接收确认中</td><td>写入持久 Run、申请配额后下发 run_id；Runtime 先准备接收，不启动推理</td><td>准备接收确认 → 控制层提交 running → 幂等 start；响应未知先按 run_id 查询；取消/超时进入 cancelling 并撤销未开始或停止已开始执行，不直接另建任务</td></tr>
+<tr><td><code>running</code></td><td>已授权执行，start 已发送或正在确认</td><td>Runtime 已持久准备接收；控制层 running 先提交，之后幂等 start，确保首次 LLM 请求可获授权</td><td>turn_done/turn_failed → finalizing；取消或超时 → cancelling；尚不释放活跃位</td></tr>
+<tr><td><code>cancelling</code></td><td>取消已受理、执行未确认停止</td><td>用户取消或总时限到达</td><td>确认进程树停止 → finalizing；无法确认则保留锁并停止整容器兜底</td></tr>
+<tr><td><code>finalizing</code></td><td>确认停止并形成 checkpoint</td><td>Runtime 终态与无旧写入者确认</td><td>记录 checkpoint 完成或明确失败 → terminal；提交失败不得假装已生成 commit，也不得携旧写入者释放锁</td></tr>
+<tr><td><code>finished / failed / cancelled</code></td><td>产品终态</td><td>停止确认及收尾结果已记录</td><td>同事务写结果、终态事件与 Factive=NULL；提交后广播，再以代码快照请求预览</td></tr>
+</table>
+<p><b>闸门：</b><code>UNIQUE(Fconv_id,Factive)</code> 仅保证活跃记录唯一（未结束为 1，结束置 NULL）。先按 client_request_id 查询幂等记录，再抢活跃位；同编号不同规范化内容返回冲突。Runtime 接受平台 run_id 并持久化执行状态，相同 run_id 不重复执行。两个事实源之间的崩溃窗口通过查询和恢复扫描对账，不能以唯一索引宣称执行「恰好一次」。</p>
+<p><b>扩容边界：</b>P0 单控制层＋启动恢复扫描，任务不依赖客户端 HTTP context 继续存活。多副本前启用 owner／lease_until／generation，generation 在对话执行域内单调递增，Runtime 拒绝旧 generation 的修改/取消；租约失效不直接解锁，必须确认旧执行已停，并补齐跨实例事件通知和配额协调。</p>
+
+<h3>5.4 Run 编排流程（伪代码）</h3>
+<pre>// 设计伪代码；错误、配额回滚和生命周期由统一分支处理，不代表已实现。
+Start(requestCtx, user, convID, requestID, content, model) {
+    conv = GetOwned(user, convID)                 // 不接受客户端伪造身份
+    inputHash = Hash(CanonicalInput(content, model))
+    tx = Begin()
+    existing = FindRequest(tx, convID, requestID)
+    if existing != nil { return SameInputOrConflict(existing, inputHash) }
+    run = InsertActiveRun(tx, conv, requestID, inputHash)  // 只有活跃记录唯一
+    InsertUserMessage(tx, run, content)
+    PersistEvent(tx, "run_accepted", run)
+    Commit(tx)                                  // 消息/Run/接收事件同时可见
+    NotifyAfterCommit(run)                      // 只是通知，Worker 以库为准
+    return Accepted(run)                        // HTTP 202
+}
+
+Drive(serviceCtx, run) {
+    sb = EnsureSandboxWithReservation(serviceCtx, run.ConvID)
+    sid = EnsureSingleSession(sb, "/workspace/app", run.Model)
+    AcquireWorkspaceExecutionGate(run)          // 含旧预览重建门控，不在 DB 长事务内等待
+    state = PrepareOrQuery(sb, sid, run.ID, run.InputHash, run.Generation)
+    // Runtime仅持久准备，不立即推理；未知响应查询同一个run_id
+    CommitRunningAuthorization(run)             // 先提交，LLM代理才允许该Run调用
+    StartOrQuery(sb, sid, run.ID, run.Generation) // 幂等start；未知响应查执行状态
+    ConsumeOrderedEventsAndReconcile(serviceCtx, sb, sid, run)
+    if CancelRequested(run) { StopAndConfirmExecution(sb, run) }
+    else { ConfirmExecutionStopped(sb, run) }
+    MarkFinalizing(run)
+    checkpoint = CommitOrRecordFailure(sb, run)  // 若仍有写入者，保持活跃位并先隔离
+    tx = Begin()
+    StoreTerminalAndCheckpoint(tx, run, checkpoint)
+    PersistEvent(tx, TerminalEvent(run))
+    ReleaseActiveRun(tx, run)                    // Factive=NULL
+    Commit(tx)
+    ReleaseWorkspaceGateAndRunQuota(run)
+    NotifyAfterCommit(run)
+    PreviewSnapshot(checkpoint.Commit)          // 快照构建；否则重新排队抢工作区门控
+}</pre>
+
+<h3>5.5 事件映射：dsh-go 原始事件 → UI 事件</h3>
+<p>控制层存原始事件（<code>t_event.Fpayload</code>），在 SSE 出口与 <code>history</code> 接口处映射。UI 事件统一结构：<code>{seq?, type, run_id, ts, data}</code>。无 <code>seq</code> 的是临时事件，不参与续传。</p>
+<table>
+<tr><th>dsh-go 事件</th><th>UI 事件</th><th>落库</th><th>说明</th></tr>
+<tr><td>—（控制层自产）</td><td><code>run_accepted / run_started</code></td><td>是</td><td>接收事件与消息/Run 同事务；Runtime 确认执行后再发 run_started，区分排队与运行</td></tr>
+<tr><td><code>message</code> role=user</td><td>丢弃</td><td>是（原始）</td><td>用户消息已在 <code>t_message</code>，前端乐观回显</td></tr>
+<tr><td><code>message</code> role=assistant，<code>content</code> 非空</td><td><code>text {content}</code></td><td>是</td><td>S5 之前整条到达；S5 之后先有临时 <code>text_delta</code>，最终仍有这条完整事件用于对账</td></tr>
+<tr><td><code>message</code> role=assistant，<code>tool_calls[]</code></td><td>每个调用一条 <code>tool_call {call_id, name, summary, args}</code></td><td>是</td><td><code>args</code> 截断到 2 KB；<code>summary</code> 取关键参数（命令 / 路径）</td></tr>
+<tr><td><code>message</code> role=tool</td><td><code>tool_result {call_id, name, content, is_error?, truncated}</code></td><td>是</td><td><code>content</code> 截断到 4 KB；<code>is_error</code> 来自 S2，S2 之前为空</td></tr>
+<tr><td><code>notice</code></td><td><code>notice {text}</code></td><td>是</td><td>活性警告、重试提示、预算提示</td></tr>
+<tr><td><code>marker</code> progress</td><td><code>progress {text}</code></td><td>否（临时）</td><td>频率高，仅用于顶部状态条</td></tr>
+<tr><td><code>marker</code> turn_done / turn_failed</td><td><code>finalizing</code>；产品终态由控制层独立生成</td><td>是（原始 marker）</td><td>只触发停止确认与 checkpoint，不直接映射成产品完成或提前解锁</td></tr>
+<tr><td>控制层收尾结果</td><td><code>run_finished / run_error / run_cancelled {commit?, checkpoint_status, usage, error_code}</code></td><td>是</td><td>同事务写结果与释放活跃位；最终文本与用量对账，内部错误及凭证脱敏。之后不覆盖原事件，补充信息用新事件表达</td></tr>
+<tr><td><code>approval</code></td><td><code>approval {id, tool, summary, state}</code></td><td>是</td><td>P0 前端不展示（full-auto 下仅留审计记录）</td></tr>
+<tr><td><code>marker</code> created / forked</td><td>丢弃</td><td>是（原始）</td><td>—</td></tr>
+<tr><td>wsd <code>file_changed</code></td><td><code>files_changed {paths[]}</code></td><td>否（临时）</td><td>前端据此刷新树与已打开文件</td></tr>
+<tr><td>wsd <code>preview_status</code></td><td><code>preview_status {status}</code></td><td>否（临时）</td><td>同时更新 <code>t_sandbox.Fpreview_status</code></td></tr>
+</table>
+
+<h3>5.6 Runtime 事件消费（至少一次接收＋事务去重）</h3>
+<pre>source = (conv.RuntimeEpoch, conv.AgentSessionID)
+cursor = LoadSourceCursor(source)              // 下一个源 seq，不同于 UI seq
+for {
+    stream = StreamWithCursor(source, cursor)  // SSE/HTTP 读取都设总字节和分页上限
+    select {
+    case ev = &lt;-stream:
+        if ev.IsEphemeralDelta() { PublishTemporary(ev); continue } // S5，无持久 seq
+        if ev.Seq &lt; cursor { continue }         // 已消费的持久源事件
+        if ev.Seq &gt; cursor { RefillGap(source, cursor); continue }
+        tx = Begin()
+        if !ev.IsProgress() {
+            InsertSourceOnce(tx, source, ev.Seq, ev) // 唯一键：epoch/session/rt_seq
+        }
+        // progress 在源日志占 seq，但不入 t_event、不分配 UI seq；仅同事务推进游标
+        AdvanceCursor(tx, source, ev.Seq + 1)
+        Commit(tx)
+        cursor = ev.Seq + 1
+        PublishCommittedOrTemporary(ev)        // 提交后通知；通知失败由库补扫
+        if ev.IsTurnEnd() { ReconcileAndFinalize(run); return }
+    case &lt;-reconcileTicker:
+        water, state = GetSourceWatermarkAndRun(source, run.ID)
+        if water &gt;= cursor { RefillGap(source, cursor) } // 覆盖最后一条丢失而无后续事件
+        if state.Terminal { ConfirmExecutionStoppedAndFinalize(run) }
+    }
+}</pre>
+<p><b>序号域与边界：</b>Runtime 原始 seq、平台持久 seq、临时 delta 三者分开。原始日志保留时 epoch 不变；日志重建/更换才增 epoch。控制层暂停与断线后重放须满足原日志仍可用、追加有序、接收游标同事务等前提；本设计不宣称双日志和网络实现端到端恰好一次。</p>
+<p><b>慢订阅处理：</b>持久事件满缓冲时断开，续传从最后完整消费游标开始；临时状态允许丢，但完整文本/终态必须对账。首屏分页历史后再连接 SSE，也必须在服务端登记订阅后补扫交集。一个原始事件映射多个卡片时用 <code>(seq,item_index/call_id)</code> 去重，不能只按 seq 丢弃其余工具调用。</p>
+
+<h3>5.7 沙箱管理</h3>
+<table>
+<tr><th>状态</th><th>说明</th></tr>
+<tr><td><code>absent</code> → <code>creating</code></td><td>首个 Run、文件访问或预览访问触发创建；创建容器 + 卷，注入三个环境变量；等待 <code>/healthz</code> 变 200</td></tr>
+<tr><td><code>running</code></td><td>可服务。记录 <code>Flast_active_time</code>（Run 事件、文件访问、预览请求都会刷新）</td></tr>
+<tr><td><code>running</code> → <code>stopped</code></td><td>空闲回收：无活跃 Run、空闲超过 30 分钟（配置项）→ <code>docker stop -t 5</code>，卷保留</td></tr>
+<tr><td><code>stopped</code> → <code>running</code></td><td>下次发消息 / 访问文件 / 访问预览时自动恢复；会话与文件均在卷上，dsh-go 懒恢复会话日志</td></tr>
+<tr><td><code>error</code></td><td>健康检查连续失败后确认旧容器已终止，保留卷并重建；活跃 Run 进入 finalizing，记录 checkpoint 完成或明确失败，同事务写 failed/终态事件及解锁，再允许新 Run</td></tr>
+<tr><td><code>removed</code></td><td>对话删除后延迟 N 天清理卷（配置项）</td></tr>
+</table>
+<ul>
+<li><b>配额：</b>运行沙箱、活跃 Run、同时构建分别设全局/用户限额，初值依据主机保留内存和实测峰值确定，不默认开放 20 个沙箱。抢名额与创建采用 reservation；失败回滚，停止确认后释放。仅淘汰无活跃 Run、无工作区收尾/构建操作的空闲沙箱；队列有界并按用户轮转（§5.11）。</li>
+<li><b>到达沙箱：</b>控制层加入沙箱专用网络，用容器 IP 访问 <code>:7000</code>；预览通道直连 <code>IP:3000</code>。</li>
+<li><b>驱动接口：</b><code>Ensure / Stop / Remove(keepVolume) / Addr / Inspect</code>。P0 固定单机 Docker；多机前除驱动外，还要解决卷与节点绑定/快照恢复、跨实例配额和事件通知，不能只换 K8s 驱动即完成扩容。</li>
+<li><b>停止期间的文件浏览：</b>P0 按需唤醒沙箱，冷启动耗时待测；访问状态批量刷新以避免每个预览请求写数据库。P1 按 checkpoint 保存文件树/代码快照，停止期间读快照。</li>
+</ul>
+
+<h3>5.8 LLM 代理</h3>
+<table>
+<tr><th>环节</th><th>设计</th></tr>
+<tr><td>鉴权</td><td>以 token_hash 查对话与 scope，校验有效期、是否已撤销、Run 正在 running 且模型/调用额度允许（queued/cancelling/terminal 拒绝）。此机制不区分同 UID 下的 Agent 和生成应用；共容器试点需限额审计，强隔离阶段使用受控执行身份/代理通道。</td></tr>
+<tr><td>模型校验</td><td>请求里的 <code>model</code> 必须在目录内且该用户可用；控制层映射到上游真实模型名与地址，并强制设置 <code>max_tokens</code> 上限</td></tr>
+<tr><td>透传语义</td><td><b>上游的 429 / 5xx 与 <code>Retry-After</code> 必须原样返回</b>。dsh-go 的重试分类（<code>openai.Retryable</code>）依赖状态码；代理若把它们吞掉改写成 200 或 500，退避与熔断就失效</td></tr>
+<tr><td>流式</td><td>代理从第一天起支持 SSE 透传，S5 上线时无需改动</td></tr>
+<tr><td>计量</td><td>记录对话、Run、模型、prompt / completion token、耗时、状态码到 <code>t_llm_usage</code>；这是用量与成本的权威来源</td></tr>
+<tr><td>供应商</td><td>P0 只接 OpenAI 兼容的上游（模型目录里 <code>protocol: openai</code>）；其他协议在代理内做转换，属于 P1</td></tr>
+<tr><td>限流</td><td>每对话并发 4、每用户 QPS 上限（初值，待调）；超限返回 429 并带 <code>Retry-After</code></td></tr>
+</table>
+
+<h3>5.9 预览代理</h3>
+<ol>
+<li>前端调用 <code>GET /api/conversations/{cid}/preview</code>，控制层返回 <code>https://{preview_key}.preview.&lt;预览域名&gt;/__enter?t=&lt;60 秒签名票据&gt;</code>。</li>
+<li>预览监听（:8081）验证票据的对话、具体 Host、nonce 和过期时间，一次性消费；设置 Host-only 的 <code>HttpOnly; Secure</code> Cookie（跨站嵌入按需 SameSite=None），重定向清除 URL 票据。撤权/删除后拒绝后续访问。</li>
+<li>之后的请求校验预览 Cookie → 受控 Host 映射到该对话 → 反代固定 <code>IP:3000</code>（不采纳用户指定上游）；剥离平台/预览管理凭证，不传给生成后端，产品自己的 Cookie 按明确白名单保留；WebSocket 同样授权并限制连接寿命。</li>
+<li>沙箱为 <code>stopped</code> 时返回「正在唤醒」页（自动刷新），同时触发恢复。</li>
+<li>预览使用与主站不同的可注册域名，主站 Cookie 不扩散至预览；iframe 按需求最小开放 sandbox 权限。第三方 Cookie 可能被浏览器阻止，SameSite=None 不保证可用，Web 必须提供「新窗口预览」备用入口。</li>
+</ol>
+
+<h3>5.10 错误码</h3>
+<table>
+<tr><th>HTTP</th><th>code</th><th>场景</th></tr>
+<tr><td>400</td><td><code>EMPTY</code> / <code>TOO_LONG</code> / <code>BAD_MODEL</code> / <code>BAD_PATH</code></td><td>参数非法</td></tr>
+<tr><td>404</td><td><code>NOT_FOUND</code></td><td>对话不存在<b>或不属于当前用户</b>（不区分，避免枚举）</td></tr>
+<tr><td>409</td><td><code>RUN_IN_PROGRESS</code></td><td>该对话已有活跃 Run</td></tr>
+<tr><td>413</td><td><code>TOO_LARGE</code></td><td>文件超过读取上限</td></tr>
+<tr><td>429</td><td><code>QUOTA_EXCEEDED</code> / <code>CONV_LIMIT</code></td><td>用户配额或对话数上限</td></tr>
+<tr><td>501</td><td><code>NOT_IMPLEMENTED</code></td><td>P1 预留接口</td></tr>
+<tr><td>503</td><td><code>SANDBOX_STARTING</code> / <code>SANDBOX_BUSY</code></td><td>沙箱启动中 / 容量不足</td></tr>
+</table>
+
+<h3 id="s5-11">5.11 按用户公平调度与构建门控</h3>
+<table>
+<tr><th>层次</th><th>控制对象</th><th>释放/过载规则</th></tr>
+<tr><td>对话修改闸门</td><td>同对话单个 active Run，包含 queued、dispatching、cancelling、finalizing</td><td>执行已停止且收尾记录提交后释放，不按 HTTP 连接退出释放</td></tr>
+<tr><td>Run 名额</td><td>全局与单用户推理/执行；每用户有界等待队列，轮转调度</td><td>接收、等待和运行额度分别核算；不得一用户排队任务占满其它用户入口</td></tr>
+<tr><td>在线沙箱名额</td><td>Agent＋预览常驻内存，沙箱 reservation 原子化</td><td>停止确认后释放；pause 不释放内存。预览访问不无限续命抢占其它用户任务</td></tr>
+<tr><td>构建名额</td><td>wsd preview 构建、模板准备及受控构建工具</td><td>预留成功才编译；失败/取消归还，锁顺序统一。build semaphore 不约束任意 bash 绕过，兜底依赖 cgroup，强预算需统一执行入口</td></tr>
+</table>
+<p>P0 单实例在进程内协调配额，同时依据数据库恢复活跃状态；队列与重启必须对账。多副本前用持久 reservation/租约或单独调度写者协调，不把每实例信号量当成全局额度。</p>
+
+<h2 id="s6">6. 接入层设计</h2>
+<h3>6.1 功能</h3>
+<table>
+<tr><th>功能</th><th>P0</th><th>说明</th></tr>
+<tr><td>TLS 终结与反向代理</td><td><span class="tag p0">实现</span></td><td>Caddy 或 Nginx</td></tr>
+<tr><td>静态资源托管</td><td><span class="tag p0">实现</span></td><td>前端构建产物；资源前缀走配置 <code>ASSET_BASE_URL</code></td></tr>
+<tr><td>SSE 友好</td><td><span class="tag p0">实现</span></td><td>对 <code>/api/</code> 关闭响应缓冲，不对事件流做压缩，开启 HTTP/2（浏览器对同域 HTTP/1.1 连接数有限制，多对话并行会受影响）</td></tr>
+<tr><td>预览域名路由</td><td><span class="tag p0">实现</span></td><td><code>*.preview.&lt;预览域名&gt;</code> 通配到控制层预览监听</td></tr>
+<tr><td>SSO</td><td><span class="tag rs">预留</span></td><td>多人 P0 用预配账号＋服务端 session cookie；SSO 接入后网关先清除客户端同名身份头再注入可信 <code>X-User-Id</code>，控制层只信受控网关，写操作校验 CSRF/Origin</td></tr>
+<tr><td>CDN / WAF / 限流</td><td><span class="tag rs">预留</span></td><td>配置里留好位置，不实现</td></tr>
+</table>
+<h3>6.2 Caddyfile 示意</h3>
+<pre>app.example.com {
+    handle /api/* {
+        reverse_proxy control:8080 {
+            flush_interval -1          # SSE 不缓冲
+        }
+    }
+    handle {
+        root * /srv/web
+        try_files {path} /index.html   # SPA 回退
+        file_server
+    }
+    # 预留：forward_auth sso:9000 { copy_headers X-User-Id }
+}
+
+*.preview.example-preview.com {
+    reverse_proxy control:8081 {
+        flush_interval -1
+    }
+}</pre>
+
+<h2 id="s7">7. Web 层设计</h2>
+<h3>7.1 功能</h3>
+<table>
+<tr><th>编号</th><th>功能</th><th>要点</th></tr>
+<tr><td>W1</td><td>对话列表</td><td>新建、切换、重命名、删除；状态徽标（空闲 / 排队 / 运行 / 出错）；最近活跃排序</td></tr>
+<tr><td>W2</td><td>聊天</td><td>每次主动发送生成 client_request_id；网络重试沿用编号，明确重新执行才新建编号；取消后显示 cancelling，直到确认终态解禁；running/finalizing 时禁模型修改</td></tr>
+<tr><td>W3</td><td>代码浏览</td><td>文件树按目录懒加载；Monaco 只读；本轮改动的文件在树上高亮；默认打开 <code>README</code> 或最近改动的文件</td></tr>
+<tr><td>W4</td><td>预览</td><td>iframe 展示已确认的 commit 版本；启动/失败/旧版本明确标记；日志尾部有字节上限；Cookie 跨站受阻时新窗口打开，异步预览不得冒充最新 Run 产物</td></tr>
+<tr><td>W5</td><td>全局</td><td>SSE 连接管理与重连、排队与限额提示、错误提示</td></tr>
+<tr><td>W6</td><td><span class="tag p1">P1</span> 推送与发布入口</td><td>P0 按钮置灰并提示「即将开放」，路由已预留</td></tr>
+</table>
+
+<h3>7.2 模块与状态</h3>
+<pre>web/src/
+├── api/            http.ts（统一错误处理）· conversations.ts · files.ts · preview.ts
+├── events/         sse.ts（带 Last-Event-ID 的重连）· reducer.ts（UI 事件 → 聊天状态）
+├── stores/         conversations.ts · chat.ts（按对话分片）· files.ts · preview.ts
+├── features/
+│   ├── conversation-list/
+│   ├── chat/       MessageList · ToolCallCard · Composer · ModelSelect
+│   ├── code/       FileTree · EditorPane
+│   └── preview/    PreviewFrame · PreviewStatus · LogDrawer
+└── App.vue         三栏布局：列表 | 聊天 | 代码 / 预览（标签切换）</pre>
+<ul>
+<li><b>按对话分片的状态：</b><code>chat[cid] = {events[], lastSeq, running, runId, progressText}</code>。切换对话不丢状态。</li>
+<li><b>首屏与重连：</b>分页读取历史，再以已完整应用的 <code>lastSeq</code> 建 SSE；服务端先登记订阅再补交集。卡片按 <code>(seq,item_index/call_id)</code> 去重，临时 delta 用独立标识，最终 text 替换/对账；重连同时对齐 Run 终态、文件树和预览版本。</li>
+<li><b>多对话并行：</b>只为「当前对话」与「运行中的对话」保持 SSE，上限 6 条；其余对话靠列表接口低频轮询状态（10 秒）。</li>
+</ul>
+
+<h3>7.3 事件渲染规则</h3>
+<table>
+<tr><th>UI 事件</th><th>渲染</th></tr>
+<tr><td><code>run_accepted / run_started / finalizing / cancelling</code></td><td>区分排队、执行、收尾与取消中，输入框保持禁用；新请求和网络重试不混用；停止确认之前不显示「已取消」</td></tr>
+<tr><td><code>text</code></td><td>Markdown 气泡；S5 之后 <code>text_delta</code> 追加到同一气泡</td></tr>
+<tr><td><code>tool_call</code> + <code>tool_result</code></td><td>按 <code>call_id</code> 配对成一张可折叠卡片：标题用 <code>summary</code>（如命令 / 路径），展开看参数与输出；<code>is_error</code> 为真时标红；<code>bash</code> 用终端样式，<code>edit_file</code> / <code>write_file</code> 点击后跳转到代码标签并打开该文件</td></tr>
+<tr><td><code>notice</code></td><td>灰色系统提示行</td></tr>
+<tr><td><code>progress</code></td><td>聊天区顶部一行状态条，不进消息列表</td></tr>
+<tr><td><code>files_changed</code></td><td>刷新已展开目录；已打开文件内容刷新；变更文件高亮</td></tr>
+<tr><td><code>preview_status</code></td><td>更新预览标签状态；就绪时刷新 iframe</td></tr>
+<tr><td><code>run_finished</code></td><td>解禁输入；显示本轮改动数与用量（可折叠）</td></tr>
+<tr><td><code>run_error / run_cancelled</code></td><td>显示停止/收尾结果及错误；只有服务端明确终态后才允许「重新执行」（新请求号）；HTTP 响应未知则查询旧 run_id，不盲目重发为新任务</td></tr>
+</table>
+
+<h2 id="s8">8. 关键流程</h2>
+<h3>8.1 发送一条消息（含冷启动）</h3>
+<svg viewBox="0 0 960 560" width="100%" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1d2129"/></marker></defs>
+<g font-size="12.5" font-weight="700" text-anchor="middle">
+<rect x="10" y="8" width="110" height="30" rx="6" fill="#f2f3ff" stroke="#c9c2f5"/><text x="65" y="28">浏览器</text>
+<rect x="190" y="8" width="130" height="30" rx="6" fill="#e8f7f0" stroke="#a8dcc4"/><text x="255" y="28">控制层</text>
+<rect x="400" y="8" width="110" height="30" rx="6" fill="#fdf1e3" stroke="#f0cfa6"/><text x="455" y="28">wsd</text>
+<rect x="590" y="8" width="130" height="30" rx="6" fill="#fdf1e3" stroke="#f0cfa6"/><text x="655" y="28">dsh-go</text>
+<rect x="790" y="8" width="150" height="30" rx="6" fill="#f2f3f5" stroke="#c9cdd4"/><text x="865" y="28">模型提供方</text>
+</g>
+<g stroke="#c9cdd4" stroke-dasharray="4 4"><path d="M65 38V555"/><path d="M255 38V555"/><path d="M455 38V555"/><path d="M655 38V555"/><path d="M865 38V555"/></g>
+<g font-size="11.5" fill="#1d2129">
+<path d="M65 62 H255" stroke="#1d2129" marker-end="url(#b)"/><text x="72" y="57">① POST /messages</text>
+<text x="262" y="82" fill="#4e5969">② 幂等校验；事务写 Run／消息／接收事件</text>
+<path d="M255 98 H65" stroke="#1d2129" marker-end="url(#b)"/><text x="100" y="93">③ 202 {run_id}</text>
+<text x="262" y="118" fill="#4e5969">④ 配额 / LRU → docker run（首次）</text>
+<path d="M255 136 H455" stroke="#1d2129" marker-end="url(#b)"/><text x="268" y="131">⑤ 轮询 /healthz</text>
+<text x="462" y="154" fill="#4e5969">拉配置、生成 models.yaml、init 模板、起 dshd</text>
+<path d="M255 176 H455" stroke="#1d2129" marker-end="url(#b)"/><text x="268" y="171">⑥ POST /agent/sessions（首次）</text>
+<path d="M455 190 H655" stroke="#1d2129" marker-end="url(#b)"/><text x="470" y="185">→ POST /v1/sessions</text>
+<path d="M255 216 H455" stroke="#1d2129" marker-end="url(#b)"/><text x="268" y="211">⑦ 准备Run → 提交授权 → 幂等start</text>
+<path d="M455 230 H655" stroke="#1d2129" marker-end="url(#b)"/><text x="470" y="225">→ 202</text>
+<path d="M255 262 H455" stroke="#1d2129" marker-end="url(#b)"/><text x="268" y="257">⑧ GET /agent/…/stream?from_seq</text>
+<path d="M455 276 H655" stroke="#1d2129" marker-end="url(#b)"/><text x="470" y="271">→ SSE</text>
+<path d="M655 304 H255" stroke="#1d2129" stroke-dasharray="5 3" marker-end="url(#b)"/><text x="360" y="299">⑨ 事件（message / tool …）</text>
+<path d="M655 330 H255" stroke="#1d2129" stroke-dasharray="5 3" marker-end="url(#b)"/><text x="360" y="325">（经 wsd 透传）</text>
+<text x="262" y="350" fill="#4e5969">⑩ 源事件去重 → 同事务写游标 → 提交后映射</text>
+<path d="M255 366 H65" stroke="#1d2129" stroke-dasharray="5 3" marker-end="url(#b)"/><text x="100" y="361">⑪ SSE 推送</text>
+<path d="M655 396 H865" stroke="#1d2129" marker-end="url(#b)"/><text x="672" y="391">⑫ 经控制层 LLM 代理（令牌 + 活跃 Run 校验）</text>
+<path d="M455 424 H255" stroke="#1d2129" stroke-dasharray="5 3" marker-end="url(#b)"/><text x="290" y="419">⑬ file_changed / preview_status</text>
+<path d="M255 440 H65" stroke="#1d2129" stroke-dasharray="5 3" marker-end="url(#b)"/><text x="100" y="435">（临时事件，无 seq）</text>
+<text x="662" y="466" fill="#4e5969">⑭ marker → 确认停止／finalizing</text>
+<path d="M255 486 H455" stroke="#1d2129" marker-end="url(#b)"/><text x="268" y="481">⑮ POST /git/commit</text>
+<text x="262" y="506" fill="#4e5969">⑯ Factive=NULL，写 run_finished</text>
+<path d="M255 524 H455" stroke="#1d2129" marker-end="url(#b)"/><text x="268" y="519">⑰ 绑定 commit 快照预览；live 模式排队</text>
+<path d="M255 546 H65" stroke="#1d2129" stroke-dasharray="5 3" marker-end="url(#b)"/><text x="100" y="541">⑱ preview_status:ready</text>
+</g>
+</svg>
+<p>图示保持四层链路；⑦ 使用 S8 的新增执行契约，响应未知必须先查询相同 run_id；⑭ 必须确认没有旧写入者，⑮ checkpoint 结果确认后，⑯ 在同事务中写终态和释放活跃位，提交后才广播。⑰ 只有基于不可变快照才可与新 Run 并行；live workspace 模式重新排队取得工作区门控，S4 在 Run 内调用则复用已有门控。停止/提交无法确认时保留锁并隔离恢复，避免下一轮修改混入旧提交。</p>
+
+<h3>8.2 其他流程</h3>
+<table>
+<tr><th>流程</th><th>步骤</th></tr>
+<tr><td>新建对话</td><td>1) <code>POST /api/conversations</code> 只写库，返回 <code>idle</code>；2) 前端立即进入该对话；3) 此时已可选择预热沙箱（打开对话页后后台调用一次 <code>Ensure</code>，用户输入第一句话时已就绪）</td></tr>
+<tr><td>断线重连</td><td>1) 浏览器 SSE 断开；2) <code>EventSource</code> 自动带 <code>Last-Event-ID</code> 重连；3) 控制层补发库中更大的 seq，再接实时流；4) 前端同时调用一次 <code>/files/tree</code> 与 <code>/preview</code> 对齐临时事件丢失的状态</td></tr>
+<tr><td>取消</td><td>1) 受理后状态 cancelling、仍持活跃位；2) supervisor 发起本 Run 执行树停止（S8）；3) 确认旧命令已停、输出隔离；4) checkpoint/明确收尾失败记录；5) 同事务写 cancelled 与解锁。不能将 ctx.Err/turn_failed 当停止证明；无法确认先停止整容器</td></tr>
+<tr><td>切换模型</td><td>1) 前端在 <code>messages</code> 请求里带 <code>model</code>，或 <code>PATCH</code> 对话；2) 控制层在下一个 Run 前调用 S1 接口；3) 下一回合开始时 dsh-go 重新解析模型</td></tr>
+<tr><td>沙箱休眠与唤醒</td><td>1) 空闲回收线程每分钟扫描；2) 满足条件则停止容器，状态 <code>stopped</code>；3) 下次访问触发 <code>Ensure</code> → 恢复容器 → wsd 重启 → dshd 重启并懒恢复会话；4) wsd 随后 <code>ensure</code> 预览</td></tr>
+<tr><td>控制层重启恢复</td><td>扫描 queued/dispatching/running/cancelling/finalizing；按相同 run_id 查 Runtime 接收/执行记录，校验 epoch，消费持久游标及终态高水位；确认旧执行停止后收尾。恢复 checkpoint 幂等；不能用「租约过期」或「响应未知」直接释放活跃位。多副本接管用更高 generation（§5.3）</td></tr>
+<tr><td>沙箱中途崩溃</td><td>先确认旧容器停止（避免两个执行者共卷），再重建并恢复源日志；Run转finalizing、记录checkpoint或其失败，同事务写failed/事件/Factive=NULL。用户只有在该终态后才能继续；上下文补合成tool结果不证明旧副作用未发生</td></tr>
+<tr><td>多用户／同用户多对话并行</td><td>每对话独立容器、卷、主会话、源游标与预览授权；同用户两个对话也不能共享可写目录。Run 与在线沙箱名额分开核算，构建另限额；有界等待队列按用户轮转，仅淘汰无执行/收尾的空闲沙箱</td></tr>
+</table>
+
+<h2 id="s9">9. 数据模型修订</h2>
+<p>在上一版 DDL 基础上，只列出变化项。命名仍遵循 <code>F</code> 前缀、字段名不超过 26 字符、<code>utf8mb4</code>。</p>
+<pre>-- t_conversation：新增
+ALTER TABLE `t_conversation`
+  MODIFY COLUMN `Ftemplate` VARCHAR(32) NOT NULL DEFAULT 'react-go-sqlite',
+  ADD COLUMN `Fagent_session_id` VARCHAR(40) NOT NULL DEFAULT '' COMMENT 'dsh-go 会话 ID，首个 Run 时写入',
+  ADD COLUMN `Frt_next_seq` INT NOT NULL DEFAULT 0 COMMENT '下一个期望消费的 dsh-go seq（与事件同事务更新）';
+
+-- t_run：去掉 Frun_offset，改用事件区间；补充结果字段
+ALTER TABLE `t_run`
+  DROP COLUMN `Frun_offset`,
+  ADD COLUMN `Frt_seq_start` INT NOT NULL DEFAULT 0,
+  ADD COLUMN `Frt_seq_end`   INT NOT NULL DEFAULT 0,
+  ADD COLUMN `Fiterations`   INT NOT NULL DEFAULT 0;
+
+-- t_event：区分来源，保留 dsh-go 原始序号
+ALTER TABLE `t_event`
+  ADD COLUMN `Fsource` TINYINT NOT NULL DEFAULT 0 COMMENT '0 runtime 原始 1 控制层自产',
+  ADD COLUMN `Frt_seq` INT NULL COMMENT 'dsh-go 原始 seq，控制层自产事件为 NULL';
+
+-- t_sandbox：沙箱令牌
+ALTER TABLE `t_sandbox`
+  ADD COLUMN `Ftoken_hash` CHAR(64) NOT NULL DEFAULT '' COMMENT 'LLM 代理令牌的 SHA-256',
+  ADD COLUMN `Fnet_addr`   VARCHAR(64) NOT NULL DEFAULT '' COMMENT '容器 IP，运行时更新';
+
+-- 新增：LLM 用量（计量与成本的权威来源）
+CREATE TABLE `t_llm_usage` (
+  `Fid` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `Fconv_id` CHAR(12) NOT NULL,
+  `Frun_id` CHAR(26) NOT NULL DEFAULT '',
+  `Fuser_id` VARCHAR(64) NOT NULL,
+  `Fmodel` VARCHAR(64) NOT NULL,
+  `Fprompt_tokens` INT NOT NULL DEFAULT 0,
+  `Fcompl_tokens` INT NOT NULL DEFAULT 0,
+  `Fcost_ms` INT NOT NULL DEFAULT 0,
+  `Fhttp_status` SMALLINT NOT NULL DEFAULT 0,
+  `Fcreate_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`Fid`),
+  KEY `idx_conv_time` (`Fconv_id`,`Fcreate_time`),
+  KEY `idx_user_time` (`Fuser_id`,`Fcreate_time`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;</pre>
+
+<h3 id="s9-1">9.1 并发与可靠交付新增契约字段</h3>
+<p>以下为设计增量，需结合实际基础表一次编写迁移；P0 尚未有平台数据库，本次未执行 DDL。字段名保持 F 前缀且 ≤26 字符。请求幂等与对话活跃唯一键各自保留，Runtime 侧必须另外持久化执行接收记录，不能只依赖控制层表。</p>
+<pre>-- 所有请求先 GetOwned(user, conv)，再按 Fconv_id + Frequest_id 去重。
+ALTER TABLE `t_run`
+  ADD COLUMN `Frequest_id` VARCHAR(64) NOT NULL COMMENT '客户端幂等请求号',
+  ADD COLUMN `Finput_hash` CHAR(64) NOT NULL COMMENT '规范化输入哈希',
+  ADD COLUMN `Fcheckpoint_status` TINYINT NOT NULL DEFAULT 0 COMMENT '0pending 1done 2failed',
+  ADD COLUMN `Fstop_confirmed` TINYINT NOT NULL DEFAULT 0,
+  ADD UNIQUE KEY `uk_conv_request` (`Fconv_id`,`Frequest_id`);
+-- 保留既有 UNIQUE(Fconv_id,Factive)，queued 至 finalizing 均为 Factive=1。
+-- Fstatus 保持既有终态值0..4，新增5dispatching 6cancelling 7finalizing，禁止重新解释旧数据。
+
+ALTER TABLE `t_conversation`
+  ADD COLUMN `Fruntime_epoch` CHAR(26) NOT NULL COMMENT '日志来源代次，保留原日志则保持不变';
+ALTER TABLE `t_event`
+  ADD COLUMN `Fruntime_epoch` CHAR(26) NULL,
+  ADD COLUMN `Fagent_session_id` VARCHAR(40) NULL,
+  ADD UNIQUE KEY `uk_source_event` (`Fruntime_epoch`,`Fagent_session_id`,`Frt_seq`);
+-- 控制层自产事件的三列为NULL；临时delta没有持久seq，不写此表。
+-- Runtime progress虽不分配UI seq，源游标仍同事务推进，断点重放不会被它卡住。
+
+-- 预留：多副本执行权落在“对话”上，generation跨Run递增。
+ALTER TABLE `t_conversation`
+  ADD COLUMN `Fworker_owner` VARCHAR(64) NULL,
+  ADD COLUMN `Flease_until` DATETIME NULL,
+  ADD COLUMN `Fexec_generation` BIGINT NOT NULL DEFAULT 0;
+-- P0单实例可先不用租约；接管时必须CAS更新，Runtime和workspace写接口拒绝旧generation。
+-- 同一日志epoch不得被两个dshd进程共写，进程内JSONL锁不能跨进程保护。</pre>
+<p><b>票据与配额：</b>预览 nonce 的一次性消费、Cookie 访问授权与吊销需要可验证存储；P0 单实例可用短时内存状态（重启全部失效），若希望重启后保留则存库。配额 reservation 和 Runtime run_id 接收记录也必须有恢复策略；不把临时 goroutine map 当成执行事实源。</p>
+
+<h2 id="s10">10. 实施顺序、性能优化与验收</h2>
+<table>
+<tr><th>步骤</th><th>内容</th><th>验收</th></tr>
+<tr><td>1. Runtime 打通与一致性</td><td>S1–S4/S6 的功能增量，S7/S8/S9 及 S10 的执行/输出上限；wsd 工作区接口与模板；不将安全修复延至多人使用后</td><td>单容器 curl 构建闭环；冷加载、取消后无写入、并发 append 顺序、响应未知重试均验证；race专项通过</td></tr>
+<tr><td>2. 控制层最小闭环</td><td>预配身份/owner、请求与执行幂等、状态机、源事件事务去重、提交后扇出、末尾补扫和 LLM 额度</td><td>同 client_request_id 返回相同 Run；202响应丢失不重复执行；数据库回滚不广播；最后终态丢失可补齐；重启按run_id/epoch恢复</td></tr>
+<tr><td>3. Web 闭环</td><td>对话列表、聊天与工具卡片、代码浏览、预览 iframe</td><td>刷新页面后聊天历史一致；改动文件高亮；预览随回合结束自动刷新</td></tr>
+<tr><td>4. 并发与隔离</td><td>Run/在线沙箱/构建三类额度、有界公平队列、无旧执行才能回收；权限、网络和同容器管理面威胁分别验证</td><td>10 用户×2对话为候选负载，不是容量承诺；越权、IPv4/IPv6出网、跨容器、宿主/数据库访问均拒绝；取消不杀预览；恢复不重复执行，超过额度明确排队/拒绝</td></tr>
+<tr><td>5. 体验与加固</td><td>S5 流式；预览独立域名与票据；日志、指标；压测</td><td>首个 token 延迟、冷启动耗时、首轮预览耗时、单机容量均有实测数据</td></tr>
+</table>
+<p><b>需要重点观测的指标：</b>冷/热启动及首轮预览 P95/P99；真实模型首段输出、429与TPM/RPM；构建峰值RSS、OOM、CPU throttling、磁盘延迟；事件提交与可见延迟、重连次数、末尾补扫；每用户队列等待、配额 reservation、取消至停止确认耗时。</p>
+<h3 id="s10-1">10.1 性能证据提炼与优化顺序</h3>
+<div class="box warn">以下为 2026-10-19 macOS ARM64、Go 1.26.0、12 逻辑CPU上的局部合成探针，未使用 Linux 容器限额、真实模型或完整构建负载。用于定位机制问题，不用于承诺生产吞吐/并发容量。</div>
+<table>
+<tr><th>证据</th><th>提炼结论</th><th>设计动作</th><th>优先级</th></tr>
+<tr><td>约120MB多行命令输出，最终回24KB；累计分配约735MB</td><td>输出截断发生在全量收集后，返回大小不限制内存；735MB是 TotalAlloc，不是峰值RSS</td><td>S10读取时有界头尾缓存、流式spill与输出限额；文件先stat再受限读；超限明确错误，不无限增Scanner</td><td>多人准入前</td></tr>
+<tr><td>1000持久事件慢订阅只收256；JSONL保留1001条（含created）</td><td>接入窗口补发不等于全过程可靠；最后一条丢失可能没有后续seq暴露缺口</td><td>S9慢订阅断开＋游标重放、源日志高水位与Run终态补扫；提交后广播</td><td>多人准入前</td></tr>
+<tr><td>200会话，每会话200条约2KB事件，保留堆增量约101.8MB</td><td>该数据只包含合成日志/内存镜像；不含真实LLM、长期bash、构建、预览</td><td>空闲Runtime与shell关闭、spill/日志保留期；header轻量缓存；检查每轮全历史投影/JSON编码/GC</td><td>资源回收先做，窗口优化按负载</td></tr>
+<tr><td>10000事件约21.1MB，Messages约1.916ms，全量Load约69.7ms</td><td>本机投影仍较快，不能据此把它定为当前最首要延迟；长对话模型输入及冷恢复继续线性增长</td><td>分页历史、上下文长度与消费预算分开；减少rootOf重复完整Load；避免持锁全量Search</td><td>长对话验收</td></tr>
+<tr><td>单写者约4892事件/s，4–64并发约5888–6179事件/s</td><td>每条open/write/close的文件系统成本在本机占大比例；增加goroutine不线性扩展</td><td>先保持顺序正确；按需要持久writer/小批量刷写，定义Sync、损坏和宕机窗口。未fsync的对照不可当强持久吞吐</td><td>压测触发，非首轮前置</td></tr>
+</table>
+<table>
+<tr><th>阶段</th><th>主要限制</th><th>先做的优化</th></tr>
+<tr><td>推理</td><td>模型并发额度、TPM/RPM、非流式等待、重试</td><td>分Run/用户额度、尊重Retry-After，S5流式与最终文本对账，不叠加无限重试</td></tr>
+<tr><td>安装与构建</td><td>Go/Node编译CPU、峰值内存、磁盘/包源I/O</td><td>模板/依赖缓存、独立构建名额、限定编译并行度；快照重复构建合并</td></tr>
+<tr><td>常驻预览</td><td>产品进程RSS、连接/带宽、用户持续访问续命</td><td>在线沙箱限额和闲置stop，预览访问节流更新last_active；HTTP/WS超时和备用新窗口</td></tr>
+<tr><td>事件与历史</td><td>事务连接池、慢订阅、全历史重连、长日志</td><td>分批回放、提交后通知、限额队列、终态补扫；仅实际达到跨实例瓶颈后再引Redis/拆服务</td></tr>
+</table>
+<h3 id="s10-2">10.2 容量口径与故障验收</h3>
+<pre>内存需求 = 平台/数据库保留 + 操作系统保留
+         + 在线沙箱数 × 空闲/预览常驻基线
+         + 同时推理数 × 额外上下文/请求体峰值
+         + 同时构建数 × 额外构建峰值</pre>
+<p>额外峰值以基线增量计算，避免重复计数；同时按CPU、磁盘、模型额度和连接/带宽取约束最小值，并保留恢复余量。<b>撤回前版「16核32GB可跑20–30活跃沙箱」的未经容器验证估算</b>。例：32GB、平台/系统预留8GB、每容器硬限2GB，不超卖的额度算例最多12个；这仍不是实测安全容量。</p>
+<ul>
+<li>测试矩阵：真实模型；1/2/4/8个同时构建；200/2000/10000条历史；冷启动和热启动分别测，不以日志合成吞吐替代全链路。</li>
+<li>故障矩阵：202响应丢失、数据库提交失败、SSE终态丢失、控制层/Runtime重启、cancel后旧命令继续、进程脱组、OOM、磁盘满、端口冲突和容器IP变化。</li>
+<li>权限矩阵：两个用户各两个对话；文件/symlink/归档越界、跨容器出网、可读token的活跃期滥用、回环管理API、第三方Cookie禁用与预览撤权。</li>
+<li>准入产物：明确最大在线沙箱/Run/构建并发、单用户额度、排队超时、硬限额和P95/P99，以实测与威胁模型共同确定。</li>
+</ul>
+
+<h2 id="s11">11. 风险与待确认项</h2>
+<div class="box warn"><p>下表中「假设」是本设计依赖、但无法从代码确认的前提；「风险」是已识别、有应对办法的问题；「未验证」是需要实测才能下结论的点。</p></div>
+<table>
+<tr><th>#</th><th>类型</th><th>事项</th><th>影响与应对</th></tr>
+<tr><td>1</td><td><span class="tag as">假设</span></td><td>dsh-go可维护S1–S10（本次仅设计修改）</td><td>如果不能改源码，需以维护分支或执行监督层补足S7–S10；不能将可靠取消/幂等/输出上限降级省略。S5流式等体验项可后置</td></tr>
+<tr><td>2</td><td><span class="tag as">假设</span></td><td>团队有内部的 Go 模块代理与 npm 镜像，沙箱可以访问</td><td>否则预览首次构建会很慢或失败；镜像里预装依赖只能缓解，不能消除</td></tr>
+<tr><td>3</td><td><span class="tag as">假设</span></td><td>所选模型供应商提供 OpenAI 兼容的 <code>chat/completions</code> + 工具调用</td><td>不兼容的供应商需要在 LLM 代理内做协议转换（P1）</td></tr>
+<tr><td>4</td><td><span class="tag as">未验证</span></td><td>dsh-go 的消息结构不保留模型的 reasoning 内容</td><td>个别要求在多轮工具调用中回传推理内容的「思考型」模型可能报错。上线前用目标模型各跑一次多轮工具调用的用例</td></tr>
+<tr><td>5</td><td><span class="tag as">风险</span></td><td>模型非流式且上游长等待，首段反馈延迟</td><td>当前progress只在模型返回后/工具完成后出现；控制层先展示受理/排队状态。S5改善到达体验，仍须实测上游首token和限额/重试延迟</td></tr>
+<tr><td>6</td><td><span class="tag as">风险</span></td><td>模型令牌可从文件或同身份进程取得，活跃期间被生成产品复用</td><td>长期Key不进沙箱；用途/模型白名单、Run调用与周期token额度、有时效/可吊销；审计异常请求。活跃Run校验仅缩短窗口，不能鉴别同UID调用者</td></tr>
+<tr><td>7</td><td><span class="tag as">风险</span></td><td>Agent、wsd、生成产品同UID；产品可访问回环dshd/读模型文件/发信号</td><td>触发条件为执行不可信产品代码；影响本对话管理面、额度与可用性。反代白名单挡不住回环直达；P0仅可信封闭试点，面向不可信输入前拆执行身份/管理通道或独立预览容器</td></tr>
+<tr><td>8</td><td><span class="tag as">风险</span></td><td>文件监听在 <code>node_modules</code> 等大目录上开销大</td><td>wsd 监听时直接排除这些目录；变更事件 500 毫秒防抖并合并路径</td></tr>
+<tr><td>9</td><td><span class="tag as">风险</span></td><td>普通Docker共享宿主内核；控制层驱动权限可能影响宿主</td><td>固定镜像/挂载集合和禁止privileged/host namespace；P0按威胁模型批准封闭试点。外部多租户前评估gVisor/Kata等；K8s本身不改变共享内核边界</td></tr>
+<tr><td>10</td><td><span class="tag as">风险</span></td><td>首轮预览耗时（前端构建 + Go 编译）</td><td>模板预装依赖；仅在源码变化时重建；后续改为开发服务器模式。以压测数据决定</td></tr>
+<tr><td>11</td><td><span class="tag as">风险</span></td><td>会话全量日志、输出、shell与spill长期累积；构建集中触发OOM</td><td>探针只验证局部增长（§10.1）；Runtime回收、输出硬上限、文件有界读取和构建额度先实现，长历史窗口/刷盘优化按负载；整机/容器容量必须实测</td></tr>
+<tr><td>12</td><td><span class="tag as">待定</span></td><td>审批在P1是否对用户开放</td><td>必须确保只有授权控制链路可批准，生成代码不能用同身份回环自行批准。审批UI不是安全边界，强拒绝约束不能被用户模式切换绕过</td></tr>
+</table>
+
+</div></body></html>
